@@ -5,13 +5,20 @@ import matplotlib.pyplot as plt
 import sys
 import cPickle
 from scipy import interpolate
+import pyximport
+pyximport.install(setup_args = {'options' :
+                                {'build_ext' :
+                                 {'libraries' : 'lapack',
+                                  'include_dirs' : np.get_include(),
+                                  }}})
+
 import grain_growth_cython as grain_growth
-import voronoi
+import voronoi_cython as voronoi
 
 
 n = 8 # number of interior points per boundary in initial graph
 t = 0.0
-k = 0.0003 # time-step
+k = 1.0e-2 #0.00003 # time-step
 C = [0.0,0.0]  # initial value only
 h = 1.0/n   # grid spacing parameter
 
@@ -22,14 +29,8 @@ film.set_resolution(h)
 """ Generate the initial conditions using a linear fit to the points of 
     a Voronoi diagram.
     """
-successful = False
-while not successful:
-    try:
-        film.initialize_graph(100)
-        successful = True
-    except ValueError:
-        """ Triple point angles were too far off to calculate. """
-        pass
+film.initialize_graph(300)
+print "YES!!!"
 
 if 'time' in sys.argv:
     time_end = float(sys.argv[sys.argv.index('time') + 1])
@@ -38,18 +39,19 @@ else:
 
 fig = plt.figure(1)
 ax = fig.add_subplot(111)
-def printplot(i):
+def printplot(i, film):
     ax.cla()
     markersize=4.0
     
     segments = film.get_plot_lines()
     lines = mpl.collections.LineCollection(segments, color='0.5')
     ax.add_collection(lines)
-    ax.set_aspect('equal')
-    ax.set_xlim(-1.1,1.1)
-    ax.set_ylim(-1.1,1.1)
-    ax.set_xticks([])
-    ax.set_yticks([])
+    ax.set_aspect('equal', 'datalim')
+    #ax.set_xlim(-1.1,1.1)
+    #ax.set_ylim(-1.1,1.1)
+    #ax.set_xticks([])
+    #ax.set_yticks([])
+    ax.autoscale_view(True,True,True)
     fig.canvas.draw()
     if 'movie' in sys.argv:
         fname = 'tmp/sim_{0:0>4}.png'.format(i)
@@ -58,33 +60,37 @@ def printplot(i):
 dt_movie = 0.005  # increment 
 t_movie  = 0.0   # acquire frame if t>t_movie
 i        = 0     # frame number
-if 'noprofile' in sys.argv:
-    while t <= time_end: #1.0:
+if True:
+    if 'noprofile' in sys.argv:
         film.update_nodes()
-        film.update_grain_boundaries()
-        if 'movie' in sys.argv:
-            if t > t_movie:
-                printplot(i)
-                i += 1
-                t_movie += dt_movie
-        if not film.regrid():
-            break
-        if film.get_timestep() < 1.9e-7:
-            print "Time:", t
-        t += film.get_timestep()
-else:
-    def runloop(t,film):
         while t <= time_end: #1.0:
-            film.update_nodes()
-            film.update_grain_boundaries()
+            #film.update_nodes()
+            #film.update_grain_boundaries()
+            film.junction_iteration()
+            if 'movie' in sys.argv:
+                if t > t_movie:
+                    printplot(i, film)
+                    i += 1
+                    t_movie += dt_movie
             if not film.regrid():
                 break
+            if film.get_timestep() < 1.9e-7:
+                print "Time:", t
             t += film.get_timestep()
+    else:
+        def runloop(t,film):
+            while t <= time_end: #1.0:
+                #film.update_nodes()
+                #film.update_grain_boundaries()
+                film.junction_iteration()
+                if not film.regrid():
+                    break
+                t += film.get_timestep()
 
 
-    def run():
-        t = 0.0
-        runloop(t,film)
+        def run():
+            t = 0.0
+            runloop(t,film)
 
 
 if 'save' in sys.argv:

@@ -7,8 +7,15 @@ cimport numpy as np
 import cython
 from cpython cimport bool
 import uuid
-import voronoi
+import voronoi_cython as voronoi
 from scipy import interpolate
+import pyximport
+pyximport.install(setup_args = {'options' :
+                                {'build_ext' :
+                                 {'libraries' : 'lapack',
+                                  'include_dirs' : np.get_include(),
+                                  }}})
+from matrix_solvers import dgtsvx, dgesv, tridiagonal_solve
 
 """ Implementation of boundary tracking method from Bronsard & Wetton
     "A Numerical Method for Tracking Curve Networks Moving with Curvature Motion"
@@ -22,6 +29,15 @@ from scipy import interpolate
     the GNU public license (GPL). This code
     is not guaranteed to work, not guaranteed
     against anything, use at your own risk, etc.
+    
+    I build this using a setup.py file along with the following command:
+
+        python setup.py build_ext --inplace
+    
+    And if you want an html file with color-coded 'python-ness' of each line:
+
+        cython -a thismodule.pyx
+    
     """
 
 cdef:
@@ -49,6 +65,8 @@ cpdef int get_tail_end():
 
 cdef double pi = 3.14159265359
 
+from libc.math cimport sqrt
+
 cdef extern from "math.h":
     double fabs(double)
     double sin(double)
@@ -56,7 +74,7 @@ cdef extern from "math.h":
     double asin(double)
     double acos(double)
     double atan(double)
-    double sqrt(double)
+    #double sqrt(double)
     long round(double)
 
 cdef double sign(double x):
@@ -67,8 +85,19 @@ cdef double sign(double x):
 
 
 @cython.profile(False)
-cdef inline double norm(np.ndarray[np.float64_t, ndim=1] n):
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef inline double norm2(np.float64_t[:] n):
     """ n is assumed to be a two-element array or list. """
+    return n[0]*n[0] + n[1]*n[1]
+
+@cython.profile(False)
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef inline double norm(np.ndarray[np.float64_t, ndim=1] n):
+#cdef inline double norm(np.float64_t[:] n):
+    """ n is assumed to be a two-element array or list. """
+    #return sqrt(norm2(n))
     return sqrt(n[0]*n[0] + n[1]*n[1])
 
 
@@ -79,14 +108,19 @@ cdef class Boundary(object):
         converted into a 1-D array of (x,y) values, with one (x,y) value for each point.
         phase_left and phase_right are the phases of grain adjacent to the grain boundary,
         with left and right referring to the perspective looking from head to tail along
-        the boundary."""
+        the boundary.
+        
+        period is the width of the periodic region (if periodic b.c.).
+        """
     cdef:
         np.ndarray b
+        #np.float64_t[:,::1] b # doesn't even compile...
+        np.ndarray b_prev_timestep
         np.ndarray v
         bool _as_points, _to_be_deleted
         char* _phase_left
         char* _phase_right
-        double _h
+        double _h, _iteration_change
         Node head, tail
         str _id
 
@@ -106,13 +140,16 @@ cdef class Boundary(object):
             """ assume it already has elements at beginning and end for extrapolated points. """
             self.b = b_initial
             
-        self.v = np.zeros([len(self.b)-2,2])
-        self._phase_left = phase_left
-        self._phase_right = phase_right
-        self._to_be_deleted = False
-        self._h = 1.0/16.0
+        self.b_prev_timestep = self.b.copy()
+        self.v               = np.zeros([len(self.b)-2,2], dtype=np.float64)
+        self._phase_left     = phase_left
+        self._phase_right    = phase_right
+        self._to_be_deleted  = False
+        self._h              = 1.0/16.0
+        self._iteration_change = 0.0
         
     def __str__(self):
+        """ What should be printed when 'print Boundary' is called? The Boundary._id value."""
         return str(self._id)
 
     def __richcmp__(Boundary self, Boundary other, int op):
@@ -122,10 +159,215 @@ cdef class Boundary(object):
         elif op == 3:
             return self._id != other._id
         
+    cdef int initialize_iteration_buffer(self) except *:
+        """ Reset self.b_prev_timestep to the current value. """
+        self.b_prev_timestep = self.b.copy()
+
+
+    cdef double get_iteration_change(self) except *:
+        """ returns the maximum change in boundary location between this iteration and the last."""
+        return self._iteration_change
+
+
+    #@cython.boundscheck(False)
+    #@cython.wraparound(False)
+    cpdef int implicit_step_junction_iteration(self, double timestep) except *:
+        """         # implicit time-step boundaries
+            # extrapolate across nodes from previous iteration
+            # Find 1/|D1Xi|^2 and other elements of matrix
+            # Solve for Xn+1
+        """
+        cdef:
+            Py_ssize_t lenb = len(self.b)
+            Py_ssize_t i
+            np.ndarray[dtype=np.float64_t, ndim=2] b_prev_iteration = np.empty((lenb,2), dtype=np.float64)
+            #np.ndarray[dtype=np.float64_t, ndim=2] b_prev_timestep
+            #np.ndarray[dtype=np.float64_t, ndim=2] b_prev_timestep_y
+            np.ndarray[dtype=np.float64_t, ndim=2] b_solve = np.empty((lenb,2), dtype=np.float64)
+            #np.ndarray[dtype=np.float64_t, ndim=2] b_solve_x
+            #np.ndarray[dtype=np.float64_t, ndim=2] b_solve_y
+            np.ndarray[dtype=np.float64_t, ndim=1] offdiagdn = np.empty((lenb-1), dtype=np.float64)
+            np.ndarray[dtype=np.float64_t, ndim=1] diag = np.empty((lenb), dtype=np.float64)
+            np.ndarray[dtype=np.float64_t, ndim=1] offdiagup = np.empty((lenb-1), dtype=np.float64)
+            np.ndarray[dtype=np.float64_t, ndim=2] M = np.empty((lenb,lenb), dtype=np.float64)
+            np.ndarray[dtype=np.float64_t, ndim=1] inv_d1xsq = np.empty((lenb), dtype=np.float64)
+            np.ndarray[dtype=np.float64_t, ndim=1] node_location = np.empty((2), dtype=np.float64)
+            double delta, delta_max, d1x, normx, normy, ptemp
+
+        lenb = len(self.b)
+        b_prev_iteration = self.b[:]
+        inv_d1xsq = np.zeros(lenb, dtype=np.float64)
+        for i in range(lenb-2):
+            #d1x = norm( b_prev_iteration[i+2]-b_prev_iteration[i] )
+            normx = b_prev_iteration[i+2,0]-b_prev_iteration[i,0]
+            normy = b_prev_iteration[i+2,1]-b_prev_iteration[i,1]
+            d1x = sqrt( normx*normx + normy*normy )
+            inv_d1xsq[i+1] = 4.0/d1x/d1x
+        
+        """ build matrix
+        First and last row are the Dirichlet boundary conditions on the 
+        extrapolated points.
+        """
+        diag      = np.ones(lenb) + 2.0*timestep*inv_d1xsq
+        offdiagup = -timestep*inv_d1xsq[:lenb-1]*np.ones(lenb-1, dtype=np.float64)
+        offdiagdn = -timestep*inv_d1xsq[1:] *np.ones(lenb-1, dtype=np.float64)
+        offdiagup[0]      = 1.0
+        offdiagdn[lenb-2] = 1.0
+
+        self.get_head_location(node_location)
+        self.b_prev_timestep[0]  = 2.0*node_location
+        
+        self.get_tail_location(node_location)
+        self.b_prev_timestep[lenb-1] = 2.0*node_location
+        
+        #self.b = dgtsvx( offdiagdn, diag, offdiagup, self.b_prev_timestep.transpose() )
+        #self.b = tridiagonal_solve( offdiagdn, diag, offdiagup, self.b_prev_timestep.transpose() )
+        
+        M      = np.diag(diag) + np.diag(offdiagup, k=1) + np.diag(offdiagdn, k=-1)
+        b_solve = np.linalg.solve( M, self.b_prev_timestep )
+        self.b = b_solve
+        #b_prev_timestep = self.b_prev_timestep[:]
+        #self.b = dgesv( M, b_prev_timestep )
+
+        #self.b = b_solve.transpose()
+        
+        delta_max = 0.0
+        for i in range(lenb):
+            normx = self.b[i,0]-b_prev_iteration[i,0]
+            normy = self.b[i,1]-b_prev_iteration[i,1]
+            delta = sqrt( normx*normx + normy*normy )
+            if delta > delta_max:
+                delta_max = delta
+        self._iteration_change = delta_max
+
+        
+    def get_previous_boundary(self, Node node):
+        """ Get the grain boundary previous to (i.e. clockwise from) 
+        the current boundary at the given node. """
+        cdef:
+            Boundary prev_boundary
+            Py_ssize_t indx, prev_endindx
+            int prev_end
+        indx = node.boundaries.index(self)
+        prev_boundary = node.boundaries[indx-1]
+        prev_endindx = node.endindx[indx-1]
+        prev_end = node.ends[indx-1]
+        return prev_boundary, prev_endindx, prev_end
+        
+
+    def get_subsequent_boundary(self, Node node):
+        """ Get the grain boundary subsequent to (i.e. anti-clockwise from) 
+        the current boundary at the given node. """
+        cdef:
+            Boundary subs_boundary
+            Py_ssize_t indx, subs_endindx, subs_indx
+            int subs_end
+        indx = node.boundaries.index(self)
+        subs_indx = indx+1 if indx+1 < len(node.boundaries) else 0
+        subs_boundary = node.boundaries[subs_indx]
+        subs_endindx = node.endindx[subs_indx]
+        subs_end = node.ends[subs_indx]
+        return subs_boundary, subs_endindx, subs_end
+        
+
+    def retract_from_node(self, Node node):
+        """ The closest point of this boundary is too close to the Node 
+        and we violate `fits_inside_triangle`. Retract the point by the 
+        distance to the previous point and interpolate to redistribute."""
+
+        if len(self.b) < 5:
+            # probably we should just delete?
+            return False
+
+        if node == self.head:
+            self.b[0] = self.b[1]
+            self.b[-1] = self.tail.position
+        else:
+            self.b[-1] = self.b[-2]
+            self.b[0] = self.head.position
+
+        self.interpolate(len(self.b), True)
+        self.extrapolate()
+
+
+    def curve_thy_neighbors(self, Node node):
+        """ Transitioning from the Voronoi diagram is a pain because the
+        intersections are not at the proper angles. Here we rotate the
+        two other boundaries that share this 'node'. The way this method is 
+        intended to be used, the actual location of the node has not yet
+        been determined (which is the whole problem). Instead, the
+        Voronoi intersection is stored in the spaces of the boundary 
+        array reserved for the extrapolated points.
+        """
+        cdef:
+            Boundary prev_boundary, subs_boundary
+            Py_ssize_t indx, prev_endindx, subs_endindx, subs_indx, lprevb, lsubsb
+            int prev_end, subs_end
+        prev_boundary, prev_endindx, prev_end = self.get_previous_boundary(node)
+        subs_boundary, subs_endindx, subs_end = self.get_subsequent_boundary(node)
+
+        b0_nodeindx, b0_indx = 0, 1
+        if self.tail == node:
+            # check if Node is connected to tail rather than head
+            b0_nodeindx, b0_indx = len(self.b)-1, len(self.b)-2
+        v0 = self.b[b0_indx] - self.b[b0_nodeindx]
+
+        prev_nodeindx, prev_indx, prev_nn = 0, 1, 2
+        if prev_boundary.tail == node:
+            # check if Node is connected to tail rather than head
+            lprevb = len(prev_boundary.b)
+            prev_nodeindx, prev_indx, prev_nn = lprevb-1, lprevb-2, lprevb-3
+        vprev = prev_boundary.b[prev_indx] - prev_boundary.b[prev_nodeindx]
+
+        subs_nodeindx, subs_indx, subs_nn = 0, 1, 2
+        if subs_boundary.tail == node:
+            # check if Node is connected to tail rather than head
+            lsubsb = len(subs_boundary.b)
+            subs_nodeindx, subs_indx, subs_nn = lsubsb-1, lsubsb-2, lsubsb-3
+        vsubs = subs_boundary.b[subs_indx] - subs_boundary.b[subs_nodeindx]
+
+        #beta_prev = np.arccos( np.dot(vprev,v0)/norm(vprev)/norm(v0) )
+        #beta_subs = np.arccos( np.dot(vsubs,v0)/norm(vsubs)/norm(v0) )
+        ## implemented without array math:
+        beta_prev = np.arccos( (vprev[0]*v0[0] + vprev[1]*v0[1])/norm(vprev)/norm(v0) )
+        beta_subs = np.arccos( (vsubs[0]*v0[0] + vsubs[1]*v0[1])/norm(vsubs)/norm(v0) )
+
+        del_prev  = -(2*np.pi/3 - beta_prev) # cw
+        del_subs  =   2*np.pi/3 - beta_subs  # ccw rotation
+
+        #prev_rotation = np.matrix([[np.cos(del_prev), np.sin(-del_prev)],[np.sin(del_prev), np.cos(del_prev)]])
+        #subs_rotation = np.matrix([[np.cos(del_subs), np.sin(-del_subs)],[np.sin(del_subs), np.cos(del_subs)]])
+        #prev_rotated = np.array(np.dot(prev_rotation, vprev))[0]
+        #subs_rotated = np.array(np.dot(subs_rotation, vsubs))[0]
+        ## implemented without array math:
+        prev_rotated = np.array([
+            np.cos(del_prev)*vprev[0] + np.sin(-del_prev)*vprev[1],
+            np.sin(del_prev)*vprev[0] + np.cos(del_prev)*vprev[1]])
+        subs_rotated = np.array([
+            np.cos(del_subs)*vsubs[0] + np.sin(-del_subs)*vsubs[1],
+            np.sin(del_subs)*vsubs[0] + np.cos(del_subs)*vsubs[1]])
+
+        prev_change = prev_rotated - vprev
+        subs_change = subs_rotated - vsubs
+
+        prev_boundary.b[prev_indx] = prev_boundary.b[prev_indx] + prev_change
+        subs_boundary.b[subs_indx] = subs_boundary.b[subs_indx] + subs_change
+
+        #prev_nn_change = prev_change - np.dot(prev_change, vprev)*vprev/norm(vprev)**2
+        #subs_nn_change = subs_change - np.dot(subs_change, vsubs)*vsubs/norm(vsubs)**2
+        ## implemented without array math:
+        prev_nn_change = prev_change - (prev_change[0]*vprev[0] + prev_change[1]*vprev[1])*vprev/norm(vprev)**2
+        subs_nn_change = subs_change - (subs_change[0]*vsubs[0] + subs_change[1]*vsubs[1])*vsubs/norm(vsubs)**2
+
+        prev_boundary.b[prev_nn] = prev_boundary.b[prev_nn] + prev_nn_change
+        subs_boundary.b[subs_nn] = subs_boundary.b[subs_nn] + subs_nn_change
+
+
     def manual_override(self, i1, i2, value):
-        """ argh. just need to tweak starting parameters on two boundaries.
+        """ argh. just need to tweak starting parameters...
         """
         self.b[i1][i2] = value
+
 
     def convert_to_points(self):
         """ It is easier to do point-by-point vector-style work with the
@@ -134,6 +376,7 @@ cdef class Boundary(object):
             being an (x,y) pair. This function converts
             into this point-by-point format."""
         assert not self._as_points
+        # Couldn't I just do self.b.transpose() ?...
         self.b = np.array(zip(list(self.b[0]), list(self.b[1])))
         self._as_points = True
 
@@ -150,7 +393,76 @@ cdef class Boundary(object):
         self._h = h
 
 
-    def extrapolate(self):
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    cpdef get_head_location(self, np.ndarray[dtype=np.float64_t, ndim=1] loc):
+        """ Return the location of the head node and shift it by node._domain_width 
+        if it exceeds the periodic b.c. """
+        cdef:
+            double x,y,x0,y0
+            Py_ssize_t indx
+            double period = self.head._domain_width
+        indx = 1
+        x,y = self.b[indx]
+        x0 = self.head.position[0]
+        y0 = self.head.position[1]
+        if fabs(x-x0) > period/2.0:
+            x0 = x0 + period if (x-x0) > 0.0 else x0 - period
+        if fabs(y-y0) > period/2.0:
+            y0 = y0 + period if (y-y0) > 0.0 else y0 - period
+        loc[0] = x0
+        loc[1] = y0
+
+
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    cpdef get_tail_location(self, np.ndarray[dtype=np.float64_t, ndim=1] loc):
+        """ Return the location of the tail node and shift it by node._domain_width 
+        if it exceeds the periodic b.c. """
+        cdef:
+            double x,y,x0,y0
+            double period = self.tail._domain_width
+            Py_ssize_t indx
+        indx = self.b.shape[1]-2
+        x,y = self.b[indx]
+        x0 = self.tail.position[0]
+        y0 = self.tail.position[1]
+        if fabs(x-x0) > period/2.0:
+            x0 = x0 + period if (x-x0) > 0.0 else x0 - period
+        if fabs(y-y0) > period/2.0:
+            y0 = y0 + period if (y-y0) > 0.0 else y0 - period
+        loc[0] = x0
+        loc[1] = y0
+
+
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    cpdef get_node_location(self, Node node, np.ndarray[dtype=np.float64_t, ndim=1] xy):
+        """ Return the location of the node and shift it by node._domain_width 
+        if it exceeds the periodic b.c. """
+        cdef:
+            Boundary gb
+            double x,y,period,x0,y0
+            Py_ssize_t indx
+        if node == self.head:
+            indx = 1
+        else:
+            indx = self.b.shape[1]-2
+        period = node._domain_width
+        x,y = self.b[indx]
+        x0 = node.position[0]
+        y0 = node.position[1]
+        #x0, y0 = node.position
+        if fabs(x-x0) > period/2.0:
+            x0 = x0 + period if (x-x0) > 0.0 else x0 - period
+        if fabs(y-y0) > period/2.0:
+            y0 = y0 + period if (y-y0) > 0.0 else y0 - period
+        xy[0] = x0
+        xy[1] = y0
+        #return np.array([x0,y0], dtype=np.float64)
+
+
+    cpdef bool extrapolate(self):
         """ Extrapolate the grain boundary across the terminations at each end of the boundary.
             The boundary needs to be in 'point-by-point' format. """
         #assert self._as_points
@@ -161,10 +473,15 @@ cdef class Boundary(object):
             return True
             
         cdef:
-            np.ndarray[np.float64_t, ndim=1] head
-            np.ndarray[np.float64_t, ndim=1] tail
-        head = self.head.position
-        tail = self.tail.position
+            np.ndarray[np.float64_t, ndim=1] head = np.empty((2), dtype=np.float64)
+            np.ndarray[np.float64_t, ndim=1] tail = np.empty((2), dtype=np.float64)
+
+        if self.head._type == domain_boundary:
+            head = self.head.position
+            tail = self.tail.position
+        else:
+            self.get_head_location(head) # self.head.position
+            self.get_tail_location(tail) # self.tail.position
 
         #!!! TODO!!!: CAN I clean this up?
         self.b[0,0], self.b[0,1] = 2*head[0]-self.b[1,0], 2*head[1]-self.b[1,1]
@@ -216,7 +533,7 @@ cdef class Boundary(object):
         """ Returns a numpy array of the boundary """
         return self.b
 
-    def get_scheduled_for_deletion(self):
+    cpdef get_scheduled_for_deletion(self):
         """ returns whether the gb is slated for deletion. """
         return self._to_be_deleted
 
@@ -226,7 +543,7 @@ cdef class Boundary(object):
         print np.mean(self.v)
 
 
-    cdef update_position(self, double k):
+    cdef void update_position(self, double k) except *:
         """ Using the velocity vector, update the positions of the interior
             points (i.e. not including the extrapolated points).
             k is the time increment (delta-t), using Bronsard-Wetton notation. """
@@ -234,15 +551,19 @@ cdef class Boundary(object):
         self.b[1:-1] = self.b[1:-1] + self.v*k
 
 
-    def densify(self):
+    cpdef densify(self, bool nodeless=False):
         """ Double the number of interior points for higher resolution
-        and redistribute the points evenly along the length of the path."""
-        if verbose: print "densify: current length:", len(self.b)
+        and redistribute the points evenly along the length of the path.
+        If nodeless==True, then use the values already stored in self.b[0] and
+        self.b[-1] as the extrapolation end points rather than accessing
+        the Node objects stored in self.head and self.tail """
+        if verbose:
+            print "densify: current length:", len(self.b)
         cdef Py_ssize_t new_length
         new_length   = round((len(self.b)-2)*2 + 2)
-        self.interpolate(new_length)
+        self.interpolate(new_length, nodeless)
 
-    def interpolate(self, Py_ssize_t new_length):
+    cpdef interpolate(self, Py_ssize_t new_length, bool nodeless):
         """ linearly interpolate and evenly redistribute points along the
         boundary after coarsening or densifying the boundary. """
         cdef:
@@ -260,6 +581,11 @@ cdef class Boundary(object):
             # gb loops on itself, so put the head mid-way between start and end
             self.b[0]  = (self.b[-2] - self.b[1])/2
             self.b[-1] = self.b[0]
+        elif nodeless:
+            pass
+        elif self.head._type == triple_point:
+            self.get_head_location(self.b[0]) # self.head.position
+            self.get_tail_location(self.b[-1]) # self.tail.position
         else:
             self.b[0]  = self.head.position
             self.b[-1] = self.tail.position
@@ -284,31 +610,27 @@ cdef class Boundary(object):
             alpha_n = (ti - s[n])/(s[n+1]-s[n])
             self.b[i+1] = old_boundary[n]*(1-alpha_n) + old_boundary[n+1]*alpha_n
 
-        self.extrapolate()
+        if not nodeless:
+            self.extrapolate()
         self.v = np.zeros([len(self.b)-2,2])
         
         
-    def coarsen(self):
+    cdef void coarsen(self, bool nodeless=False) except *:
         """ halve the number of interior points, but keep the two interior end points and
-            the two exterior extrapolated points. """
-        #TODO: should interpolate and make this smarter and keep num interior points
-        # to be a multiple of two
+            the two exterior extrapolated points.
+            If nodeless==True, then use the values already stored in self.b[0] and
+            self.b[-1] as the extrapolation end points rather than accessing
+            the Node objects stored in self.head and self.tail (which won't yet exist if 
+            you are still building the graph, for example)."""
+
         cdef Py_ssize_t new_length
         new_length = round((len(self.b)-2)/2 + 2)
-        self.interpolate(new_length)
-        
-        #old_boundary = self.b[:]
-        #print new_length
-        #self.b = np.zeros([new_length,2])
-        #self.b[-2] = old_boundary[-2]
-        #print 'half way.', np.shape(self.b[1:-2]), np.shape(old_boundary[1:-2:2])
-        #self.b[1:-2] = old_boundary[1:-2:2]
-        #print 'survived!'
-        #self.extrapolate()
-        #self.v = np.zeros([len(self.b)-2,2])
+        if len(self.b) < 5:
+            raise ValueError("Trying to coarsen boundary to fewer than 2 interior points.")
+        self.interpolate(new_length, nodeless)
         
 
-    cdef check_spacing(self):
+    cpdef check_spacing(self, bool nodeless=False):
         """ we need to refine our mesh when it gets too coarse, coarsen it when it gets dense,
             and cut it when it gets to 2 interior points. """
 
@@ -344,9 +666,9 @@ cdef class Boundary(object):
             return False
 
         if nu > 4.0:
-            self.densify()
+            self.densify(nodeless)
         if nu < 1.0/4.0 and lenb > 4.0:
-            self.coarsen()
+            self.coarsen(nodeless)
 
 
     def set_termination(self, int end, Node termination):
@@ -376,7 +698,7 @@ cdef class Boundary(object):
             return self.tail
 
 
-    cdef bool will_die_alone(self):
+    cpdef will_die_alone(self):
         """ Are there any to_be_deleted grain boundaries attached
             to the same triple points as this grain boundary? """
         cdef int num_also_dying
@@ -413,7 +735,8 @@ cdef class Node(object):
     cdef list boundaries, nodes, ends, endindx
     cdef Py_ssize_t bendindx
     cdef int bend
-    def __init__(self, int node_type):
+    cdef double _domain_width
+    def __init__(self, int node_type, double period=1.0e15):
         assert node_type in [empty, triple_point, domain_boundary]
         self._type = node_type
         self._id = str(uuid.uuid1())
@@ -422,6 +745,7 @@ cdef class Node(object):
         self.nodes = []
         self.ends = []
         self.endindx = []
+        self._domain_width = period
         
     def __str__(self):
         return str(self._id)
@@ -436,15 +760,15 @@ cdef class Node(object):
         else:
             return NotImplemented
 
-    def get_id(self):
-        """ Generate a unique ID for this node using uuid module. """
-        self._id = str(uuid.uuid1())
+    cpdef get_id(self):
+        """ Return the id of this Node object. """
+        return self._id
 
-    def get_type(self):
+    cpdef get_type(self):
         """ return integer describing node type """
         return self._type
 
-    def get_number_dying_boundaries(self):
+    cpdef get_number_dying_boundaries(self):
         """ # boundaries to be deleted from this node. """
         num_dying = 0
         for gb in self.boundaries:
@@ -488,12 +812,59 @@ cdef class Node(object):
             that is connected to this triple point.
         """
         assert self._type == triple_point
+        cdef Boundary bndry
         for b in [b1,b2,b3]:
-            boundary, indx, end = self.parse_boundary(b)
-            self.boundaries.append(boundary)
+            bndry, indx, end = self.parse_boundary(b)
+            #bndry.check_spacing(True)
+            self.boundaries.append(bndry)
             self.endindx.append(indx)
             self.ends.append(end)
+
+        if not self.fits_inside_triangle():
+            print 'adjusting boundaries for node {0} at {1}'.format(self.get_id().split('-')[0], self.position)
+            #bndry = self.get_shorty_boundary()
+            bndry = self.get_obtuse_boundary()
+            bndry.curve_thy_neighbors(self)
+            #bndry.retract_from_node(self)
+            
+            #self.shift_closest_points()
+            #for i in range(2):
+            #    if not self.fits_inside_triangle():
+            #        bndry = self.get_shorty_boundary()
+            #        bndry.coarsen(True)
+
+            #if not self.fits_inside_triangle():
+            #    self.shift_closest_points()
+            
         self.update_position()
+
+
+    def shift_closest_points(self):
+        """ We're having trouble making a Node that works, so shift all points
+        to be the same distance from self.position and this should
+        guarantee that a node solution is possible. """
+        cdef:
+            Boundary b
+            Py_ssize_t indx, i
+            np.ndarray[dtype=np.float64_t, ndim=1] point = np.empty((2))
+
+        dist_to_node = []
+        for i in range(3):
+            self.get_closest_interior_point(i, point)
+            dist_to_node.append( norm(point - self.position) )
+        
+        closest      = np.argmin(dist_to_node)
+        closest_dist = min(dist_to_node)
+        for i,b,indx in zip(range(3),self.boundaries,self.endindx):
+            if i == closest:
+                continue
+            
+            self.get_closest_interior_point(i, point)
+            v = self.position - point
+            shift_direction = v/norm(v)
+            shift_distance  = norm(v) - closest_dist
+            b.b[indx] = b.b[indx] + shift_direction*shift_distance
+            
         
     def replace_boundary(self, Boundary a, Boundary b, int bend):
         """ Replace boundary a with b (for example after a concatenation). """
@@ -505,33 +876,93 @@ cdef class Node(object):
         
 
 
-    def parse_boundary(self, bdict):
+    cpdef parse_boundary(self, bdict):
         """ Parse dictionary, saving boundary and info on proper end point
         and set_termination on the boundary so that it points to this triple-point. """
         assert bdict['end'] in [head_end, tail_end]
-        array_position = 1 if bdict['end'] == head_end else -2
-        bdict['b'].set_termination( bdict['end'], self )
-        return bdict['b'], array_position, bdict['end']
+        cdef Boundary bndry
+        bndry = bdict['b']
+        array_position = 1 if bdict['end'] == head_end else len(bndry.b)-2
+        bndry.set_termination( bdict['end'], self )
+        return bndry, array_position, bdict['end']
 
 
-    cpdef int update_position( self, bool verbose=False, bool check_angles=False ) except *:
-        """ Send in the list of boundaries, each of which ends at the center-point,
-            and use them to calculate the new center-point. """
+    cpdef set_position(self, np.ndarray[dtype=np.float64_t, ndim=1] position):
+        """ Manually set the position of the Node (usually this is done
+        instead via calculation in update_position) """
+        self.position = position
+        
+
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    #cdef void get_closest_interior_point(self, Py_ssize_t indx, double[:] closest_point) except *:
+    cdef void get_closest_interior_point(self, Py_ssize_t indx, np.ndarray[dtype=np.float64_t, ndim=1] closest_point) except *:
+        """ Return the point on the boundary closest to the node (i.e. point [1] or 
+        point [-2]) and shift it by self._domain_width if it exceeds the periodic b.c. """
         cdef:
             Boundary gb
+            double x,y,x0,y0,domain_width
+            #np.ndarray[dtype=np.float64_t, ndim=1] closest_point
+            #double [:] closest_point = np.empty((2))
+            Py_ssize_t bendindx
+                    
+        gb   = self.boundaries[indx]
+        bendindx = 1 if self.ends[indx] == head_end else len(gb.b)-2
+        x, y = gb.b[bendindx]
+        x0, y0 = self.position
+        domain_width = self._domain_width 
+        if fabs(x-x0) > domain_width/2.0:
+            x = x - domain_width if (x-x0) > 0.0 else x + domain_width
+                
+        if fabs(y-y0) > domain_width/2.0:
+            y = y - domain_width if (y-y0) > 0.0 else y + domain_width
+
+        #closest_point = np.array([x,y], dtype=np.float64)
+        closest_point[0] = x
+        closest_point[1] = y
+        #return closest_point
+
+    #cdef get_triangle(self, double[:] p0, double[:] p1, double[:] p2):
+    @cython.boundscheck(False)
+    @cython.wraparound(False)
+    cpdef get_triangle(self, np.ndarray[dtype=np.float64_t, ndim=1] p0,
+        np.ndarray[dtype=np.float64_t, ndim=1] p1, np.ndarray[dtype=np.float64_t, ndim=1] p2):
+        """ Returns a tuple of the three end points of the Node in
+        counter-clockwise order """
+        #cdef:
+            #double [:] p0 = np.empty((2))
+            #double [:] p1 = np.empty((2))
+            #double [:] p2 = np.empty((2))
+            #np.ndarray[dtype=np.float64_t, ndim=1] p0 = np.empty((2))
+            #np.ndarray[dtype=np.float64_t, ndim=1] p1 = np.empty((2))
+            #np.ndarray[dtype=np.float64_t, ndim=1] p2 = np.empty((2))
+        self.get_closest_interior_point(0,p0)
+        self.get_closest_interior_point(1,p1)
+        self.get_closest_interior_point(2,p2)
+        return p0,p1,p2
+
+
+    @cython.boundscheck(False)
+    @cython.wraparound(False) # TODO: replace self.bendindx with only non-negative values
+    cpdef int update_position( self, bool verbose=False, bool check_angles=False ) except *:
+        """ Calculate the new location of the triple-point. """
+        cdef:
+            Boundary gb, bndry
             double x,y,theta,theta1,theta2,theta3
             double l1, l2, l3
             double alpha, delta, beta, dilation
             np.ndarray[np.float64_t, ndim=2] b
-            np.ndarray[np.float64_t, ndim=1] b1N
-            np.ndarray[np.float64_t, ndim=1] b2N
-            np.ndarray[np.float64_t, ndim=1] b3N
+            #double[:,::1] b
+            np.ndarray[np.float64_t, ndim=1] b1N = np.empty((2))
+            np.ndarray[np.float64_t, ndim=1] b2N = np.empty((2))
+            np.ndarray[np.float64_t, ndim=1] b3N = np.empty((2))
             np.ndarray[np.float64_t, ndim=1] v13
             np.ndarray[np.float64_t, ndim=1] v21
             np.ndarray[np.float64_t, ndim=1] v23
             np.ndarray[np.float64_t, ndim=1] C
             #np.ndarray[np.float64_t, ndim=2] rotation
             Py_ssize_t i
+            Py_ssize_t bendindx
             
         if self._type == domain_boundary:
             """ Find where the grain boundary 'gb' would intersect the domain boundary if
@@ -539,19 +970,32 @@ cdef class Node(object):
             self.b needs to be in 'point-by-point' format. """
             gb = self.b
             b = gb.b
-            x, y = b[self.bendindx,0], b[self.bendindx,1]
+            bendindx = 1 if self.bend == head_end else len(b)-2
+            x, y = b[bendindx,0], b[bendindx,1]
             theta = atan(fabs(y/x))
             self.position[0] = sign(x)*cos(theta)
             self.position[1] = sign(y)*sin(theta)
         else:
+            if 0 == self.fits_inside_triangle():
+                print 'adjusting boundaries for node {0} at {1}'.format(self.get_id().split('-')[0], self.position)
+                #bndry = self.get_shorty_boundary()
+                #bndry.curve_thy_neighbors(self)
+                bndry = self.get_obtuse_boundary()
+                bndry.retract_from_node(self)
+                bndry.extrapolate()
+
             theta1 = theta2 = theta3 = 2.0*pi/3.0
-            gb = self.boundaries[0]
-            b1N = gb.b[self.endindx[0]]
-            gb = self.boundaries[1]
-            b2N = gb.b[self.endindx[1]]
-            gb = self.boundaries[2]
-            b3N = gb.b[self.endindx[2]]
-            #b1N, b2N, b3N = [gb.b[endpt] for gb, endpt in zip(self.boundaries, self.endindx)]
+            self.get_closest_interior_point(0,b1N)
+            self.get_closest_interior_point(1,b2N)
+            self.get_closest_interior_point(2,b3N)
+            #print "  node ID:", self.get_id()
+            #print "   triangle:", self.get_triangle()
+            #gb = self.boundaries[0]
+            #b1N = gb.b[self.endindx[0]]
+            #gb = self.boundaries[1]
+            #b2N = gb.b[self.endindx[1]]
+            #gb = self.boundaries[2]
+            #b3N = gb.b[self.endindx[2]]
             v13 = b3N - b1N # vector running from pt1 to pt3
             v21 = b1N - b2N # vector running from pt2 to pt1
             v23 = b3N - b2N # vector running from pt2 to pt3
@@ -597,12 +1041,143 @@ cdef class Node(object):
                     print "theta1, theta2, theta3:", t1, t2, t3
 
             if delta < 0:
+                print "  node ID, location:", self.get_id().split('-')[0], self.position
+                #print "   triangle:", self.get_triangle()
                 print "  C is:", C
                 print "  b1N, b2N, b3N:", b1N, b2N, b3N
                 raise ValueError("Bring points together. Your triangle of endpoints is too open to contain the triple point.")
-
+            else:
+                #print "   good: b1N, b2N, b3N:", b1N, b2N, b3N
+                #print "   good: l2/l1, l3/l1:", l2/l1, l3/l1
+                pass
+                
             self.position = C
+            
+    def get_position(self):
+        """ Just for testing. """
+        return self.position
         
+    cdef int fits_inside_triangle(self):
+        """ If the triangle formed by the initial endpoints of 
+        the three intersecting boundaries is too oblique (i.e. if 
+        one of the angles is larger than 120 degrees, then the 
+        node point will not fit inside the triangle. """
+        cdef:
+            double theta_node, l1, l2, l3
+            double phi1, phi2, phi3
+            np.ndarray[dtype=np.float64_t, ndim=1] p1
+            np.ndarray[dtype=np.float64_t, ndim=1] p2
+            np.ndarray[dtype=np.float64_t, ndim=1] p3
+            np.ndarray[dtype=np.float64_t, ndim=1] v13
+            np.ndarray[dtype=np.float64_t, ndim=1] v21
+            np.ndarray[dtype=np.float64_t, ndim=1] v23
+            int true=1, false=0
+        theta_node = 2.0*pi/3.0
+        p1 = np.empty((2))
+        p2 = np.empty((2))
+        p3 = np.empty((2))
+        self.get_triangle(p1,p2,p3)
+        v13 = p3 - p1 # vector running from pt1 to pt3
+        v21 = p1 - p2 # vector running from pt2 to pt1
+        v23 = p3 - p2 # vector running from pt2 to pt3
+        l1 = norm( v23 )
+        l2 = norm( v13 )
+        l3 = norm( v21 )
+        #l1 = sqrt(
+
+        """ If any of the following three angles is negative, then the node 
+        won't fit in the interior of the triangle. """
+        phi1 = theta_node - acos(-(v21[0]*v13[0]+v21[1]*v13[1])/l2/l3) # np.arccos( dot(v21,-v13)/l2/l3) )
+        phi2 = theta_node - acos( (v21[0]*v23[0] + v21[1]*v23[1])/l1/l3 )
+        phi3 = theta_node - acos( (v23[0]*v13[0] + v23[1]*v13[1])/l1/l2 )
+        if (phi1 < 0) or (phi2 < 0) or (phi3 < 0):
+            return false
+        else:
+            return true
+            
+
+    def get_problematic_boundaries(self):
+        """ Return the two Boundary objects that should be brought closer to 
+        the node to make self.fits_inside_triangle() return True. """
+        theta_node = 2.0*pi/3.0
+        p1 = np.zeros((2), dtype=np.float64)
+        p2 = np.zeros((2), dtype=np.float64)
+        p3 = np.zeros((2), dtype=np.float64)
+        self.get_triangle(p1,p2,p3)
+        v13 = p3 - p1 # vector running from pt1 to pt3
+        v21 = p1 - p2 # vector running from pt2 to pt1
+        v23 = p3 - p2 # vector running from pt2 to pt3
+        l1 = norm( v23 )
+        l2 = norm( v13 )
+        l3 = norm( v21 )
+        phi1 = theta_node - acos(-(v21[0]*v13[0]+v21[1]*v13[1])/l2/l3) # np.arccos( dot(v21,-v13)/l2/l3) )
+        phi2 = theta_node - np.arccos( np.dot(-v21,-v23)/l1/l3 )
+        phi3 = theta_node - np.arccos( np.dot(v23,v13)/l1/l2 )
+        if (phi1 < 0):
+            return self.boundaries[1], self.boundaries[2]
+        elif (phi2 < 0):
+            return self.boundaries[0], self.boundaries[2]
+        elif (phi3 < 0):
+            return self.boundaries[0], self.boundaries[1]
+        else:
+            return False
+
+
+    cpdef Boundary get_shorty_boundary(self):
+        """ Return the shortest Boundary object connected to the current Node.
+        (length is calculated as the crow flies from head to tail). """
+        cdef Boundary b1,b2,b3
+        
+        b1 = self.boundaries[0]
+        b2 = self.boundaries[1]
+        b3 = self.boundaries[2]
+
+        l1 = norm( b1.b[-1] - b1.b[0] )
+        l2 = norm( b2.b[-1] - b2.b[0] )
+        l3 = norm( b3.b[-1] - b3.b[0] )
+        
+        if (l1 < l2) and (l1 < l3):
+            return self.boundaries[0]
+        elif (l2 < l1) and (l2 < l3):
+            return self.boundaries[1]
+        elif (l3 < l2) and (l3 < l1):
+            return self.boundaries[2]
+        else:
+            raise ValueError("All boundaries have length {0}? WTF?".format(l1))
+
+    cpdef Boundary get_obtuse_boundary(self):
+        """ The end points of the three boundaries form a triangle that
+        surrounds the Node. Return the Boundary object whose
+        end point is the vertex of the triangle with the largest angle.
+        This method will be typically only used when this maximum angle
+        is actually >120 degrees, so even more than obtuse."""
+        cdef Boundary b
+
+        theta_node = 2.0*pi/3.0
+        p1 = np.zeros((2), dtype=np.float64)
+        p2 = np.zeros((2), dtype=np.float64)
+        p3 = np.zeros((2), dtype=np.float64)
+        self.get_triangle(p1,p2,p3)
+        v13 = p3 - p1 # vector running from pt1 to pt3
+        v21 = p1 - p2 # vector running from pt2 to pt1
+        v23 = p3 - p2 # vector running from pt2 to pt3
+        l1 = norm( v23 )
+        l2 = norm( v13 )
+        l3 = norm( v21 )
+
+        """ If any of the following three angles is negative, then the node 
+        won't fit in the interior of the triangle. """
+        phi1 = theta_node - acos(-(v21[0]*v13[0]+v21[1]*v13[1])/l2/l3) # np.arccos( dot(v21,-v13)/l2/l3) )
+        phi2 = theta_node - np.arccos( np.dot(-v21,-v23)/l1/l3 ) #TODO: Hand code dot product!!!
+        phi3 = theta_node - np.arccos( np.dot(v23,v13)/l1/l2 )
+        if (phi1 < 0):
+            return self.boundaries[0]
+        elif (phi2 < 0):
+            return self.boundaries[1]
+        elif (phi3 < 0):
+            return self.boundaries[2]
+        else:
+            raise ValueError("All angles are less than 120 degrees, so why are you running this method?")
 
 cdef class ThinFilm(object):
     """ A class for simulating thin-film grain growth using the boundary
@@ -611,7 +1186,7 @@ cdef class ThinFilm(object):
         follow Bronsard & Wetton.
     """
     cdef:
-        double _k, _h
+        double _k, _h, _domain_width, _convergence
         list boundaries, nodes
         
     def __init__(self, boundaries=None, nodes=None):
@@ -620,16 +1195,24 @@ cdef class ThinFilm(object):
             self.add_nodes(nodes)
         self._k = 0.0003
         self._h = 1.0/16.0
-    
+        self._domain_width = 1.0
+        self._convergence = 1.0e-5
+
+    def set_convergence(self, double level):
+        """ sum of changes on all boundaries must be less than this value. """
+        self._convergence = level
+
     def initialize_graph(self, num_grains=2500, num_interior_points_per_boundary=8):
         """ Generate an initial set of Boundary and Node objects
         using a Voronoi diagram from a set of num_grains randomly spaced
         points on a domain with periodic boundary conditions. 
-        The width and height of the simulation domain will both be set 
+        The width and height of the simulation domain will be set 
         equal to the square root of n (so that one spatial unit of 
         the domain is approximately equal to the average grain 
         diameter in the initial graph)."""
-        width = height = np.sqrt(num_grains)
+        # magnification factor from Voronoi diagram to our simulation region:
+        mag = np.sqrt(num_grains)
+        self._domain_width = mag
         segments, nodelist, node_segments = voronoi.periodic_diagram_with_nodes(num_grains)
         boundaries = []
         nodes = []
@@ -640,29 +1223,21 @@ cdef class ThinFilm(object):
                 head: int, node id number
                 tail: int, node id number """
             
-            # magnification factor from Voronoi diagram to our simulation region:
-            mag = np.sqrt(num_interior_points_per_boundary)
             p0 = np.array(s['points'][0], dtype=np.float64)*mag
             p1 = np.array(s['points'][1], dtype=np.float64)*mag
-            if norm(p1-p0) < self._h:
-                n  = num_interior_points_per_boundary
-            else:
-                n  = 2
+            n  = num_interior_points_per_boundary
             
             b  = np.zeros((n+2, 2), dtype=np.float64)
             for i in range(n):
                 b[i+1,:] = p0 + (i+1.0)/(n+1.0)*(p1-p0)
 
-            #if norm(p1-p0)/n > self._h/5.0:
-            #    b[1,:] = p0 + self._h/5.0*(p1-p0)/norm(p1-p0)
-            #    b[-2,:] = p1 - self._h/5.0*(p1-p0)/norm(p1-p0)
-
             # These two spaces in b will be over-written by extrapolated points, 
             # but for now I'll just store the node locations
             b[0,:] = p0
-            b[-1,:] = p1
+            b[len(b)-1,:] = p1
             boundaries.append( Boundary(b, as_points=True) )
-            
+        
+        print "made boundaries."
         for node_id, [j, k, l] in zip(nodelist, node_segments):
             b1 = boundaries[j]
             b2 = boundaries[k]
@@ -675,34 +1250,41 @@ cdef class ThinFilm(object):
             b1b = b1.get_boundary()
             b2b = b2.get_boundary()
             b3b = b3.get_boundary()
-            v1 = np.array(b1b[-2]) - np.array(b1b[1])
-            v2 = np.array(b2b[-2]) - np.array(b2b[1])
-            v3 = np.array(b3b[-2]) - np.array(b3b[1])
+            v1 = np.array(b1b[len(b1b)-2]) - np.array(b1b[1])
+            v2 = np.array(b2b[len(b2b)-2]) - np.array(b2b[1])
+            v3 = np.array(b3b[len(b3b)-2]) - np.array(b3b[1])
+            
+            
+            """ Flip so that all vectors point away from triple point to 
+            enable our cross-product test below """
             if b1end == head_end:
-                v1 = -1*v1 
+                v1 = -1*v1
             if b2end == head_end:
-                v2 = -1*v2 
+                v2 = -1*v2
 
+            if b1end == head_end:
+                node_location = b1b[0]
+            else:
+                node_location = b1b[len(b1b)-1]
+            # print 'Node location is:', node_location
+
+
+            """ Order counter-clockwise around node: """
             if v1[0]*v2[1] < v2[0]*v1[1]: # same as np.cross(v1,v2) < 0:
                 b_temp = b2
+                b_end_temp = b2end
                 b2 = b3
+                b2end = b3end
                 b3 = b_temp
+                b3end = b_end_temp
             
-            node = Node(node_type=triple_point)
+            node = Node(node_type=triple_point, period=mag)
+            node.set_position(node_location)
             node.add_boundaries(
                 dict(b=b1, end=b1end),
                 dict(b=b2, end=b2end),
                 dict(b=b3, end=b3end))
 
-            # check update_position to see if delta<0 ?
-            try:
-                node.update_position()
-            except ValueError:
-                # I think this is most likely to fail when you have a segment intersect
-                # an otherwise straight segment. Let's try to identify the intersecting segment
-                # and bring the other two points in closer.
-                print 'hi'
-                
             nodes.append( node )
 
         self.add_boundaries(boundaries)
@@ -718,7 +1300,7 @@ cdef class ThinFilm(object):
         self.nodes = nodes
         
 
-    cdef bool delete_single_boundary(self, Boundary gb):
+    cpdef delete_single_boundary(self, Boundary gb):
         """ Delete an isolated boundary. There are four different scenarios
         here, and each one must be handled separately.
         
@@ -933,7 +1515,7 @@ cdef class ThinFilm(object):
                         if verbose: print "  gb2 == gb for gb2={0}".format(gb2)
             return True
 
-    cdef concatenate_boundaries(self, Boundary a, int aend, Boundary b, int bend):
+    cdef int concatenate_boundaries(self, Boundary a, int aend, Boundary b, int bend) except *:
         """ Stitch boundaries a and b together, connecting aend to bend and
         equalizing the number of points of each boundary so that the number 
         of interior points of the combined boundary will still be a power of 2
@@ -1075,7 +1657,10 @@ cdef class ThinFilm(object):
             are surgically repaired across the void. """
             
         to_be_deleted = []
-        cdef Boundary b
+        cdef:
+            Boundary b
+            Py_ssize_t i,j
+            
         for b in self.boundaries:
             if b.check_spacing() == False:
                 to_be_deleted.append(b)
@@ -1148,9 +1733,89 @@ cdef class ThinFilm(object):
         self._h = h
 
 
+    def test_junction_iteration(self):
+        self.initialize_iteration_buffers()
+        self.implicit_solve_junction_iteration()
+        
+
+    def junction_iteration(self):
+        """Use the "junction iteration" method of 
+        Bronsard and Wetton (which is basically what
+        Frost, Thompson, and Carel used) to do implicit
+        time-stepping over a time increment 'timestep' """
+
+        cdef int i, ilimit
+        
+        i      = 0
+        ilimit = 1000
+        
+        self.initialize_iteration_buffers()
+        self.implicit_solve_junction_iteration()
+        self.update_nodes()
+        while self.converged() != 1:
+            i += 1
+            if i > ilimit:
+                raise ValueError("Did not converge within {0} iterations".format(ilimit))
+
+            self.implicit_solve_junction_iteration()
+            self.update_nodes()
+
+        if verbose: 
+            print 'num iterations:', i
+        
+    def extrapolate_all_boundaries(self):
+        """ just for testing. """
+        cdef Boundary b
+        for b in self.boundaries:
+            b.extrapolate()
+        
+            
+    cdef void implicit_solve_junction_iteration(self) except *:
+        """ set up and solve the matrix for implicitly solving for the 
+        boundary location using B&W's junction iteration model """
+
+        cdef Boundary b
+        
+        for b in self.boundaries:
+            b.extrapolate()
+            b.implicit_step_junction_iteration(self._k)
+
+
+    cdef int converged(self) except *:
+        """ Check if aggregate difference between current and previous (Xi) boundary locations
+        is within the limit set by self._convergence """
+        cdef:
+            double max_change, change
+            Boundary b
+        max_change = 0.0
+        for b in self.boundaries:
+            change = b.get_iteration_change()
+            if change > max_change:
+                max_change = change
+
+        if max_change < self._convergence:
+            return 1
+        else:
+            return 0
+        
+        
+    cpdef initialize_iteration_buffers(self):
+        """ Reset the previous-time (Xn) boundary array
+        within each Boundary object to equal the 
+        current value of Boundary.b. """
+
+        cdef Boundary b
+        for b in self.boundaries:
+            b.extrapolate()
+            b.initialize_iteration_buffer()
+        
+
     cpdef update_grain_boundaries(self):
         """ Cycle through the list of grain boundaries and update
-            their locations. """
+            their locations.
+            
+            This uses explicit time-stepping, so it's really only
+            good for the simple few-boundary tests from Bronsard & Wetton."""
         cdef:
             double min_velocity, v
             Py_ssize_t i
@@ -1177,5 +1842,29 @@ cdef class ThinFilm(object):
         for tp in self.nodes:
             tp.update_position()
     
+
+"""
+   ----------------------------------------------
+"""
+def test_update_node_position(p1,p2,p3):
+    """ Send in three points (x0,y0) and see if they would 
+    work for a triple-point. """
+    cdef:
+        Boundary b1, b2, b3 
+        Node node
+    b1 = Boundary(np.zeros([2,4]))
+    b2 = Boundary(np.zeros([2,4]))
+    b3 = Boundary(np.zeros([2,4]))
+    b1.manual_override(1,0,p1[0])
+    b1.manual_override(1,1,p1[1])
+    b2.manual_override(1,0,p2[0])
+    b2.manual_override(1,1,p2[1])
+    b3.manual_override(1,0,p3[0])
+    b3.manual_override(1,1,p3[1])
+    
+    node = Node(node_type=type_triple_point())
+    node.add_boundaries(dict(b=b1, end=get_head_end()),
+                             dict(b=b2, end=get_head_end()),
+                             dict(b=b3, end=get_head_end()))
 
 
