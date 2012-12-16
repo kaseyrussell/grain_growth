@@ -30,9 +30,9 @@ film.set_resolution(h)
     a Voronoi diagram.
     """
 def runtest():
-    film.initialize_graph(50)
+    film.initialize_graph(1000)
 
 if __name__ == '__main__':
-    film.initialize_graph(50)
+    film.initialize_graph(1000)
 
 

@@ -58,43 +58,19 @@ def voronoi(Py_ssize_t n, bool periodic=False, bool include_nodes=False):
     ncenters  = len(C)
     
     segments     = []
-    indx_counted = []
-    node         = 0
-    print "number of centers:", ncenters
-    for i in xrange(ncenters):
+    for i,center in enumerate(C):
         neighbors = D.triangle_neighbors[i]
         for k in neighbors:
             """ The triangle neighbors are the triangles that share edges
             with a given triangle. The segments of the Voronoi diagram 
             connect the centers of circumscribed circles in the neighboring
             triangles. """
-            if k != -1:
+            if k > i:
+                """ This avoids double counting and k==-1 """
                 if include_nodes:
-                    """ Avoid double-counting """
-                    if False:
-                        already_counted = False
-                        for s in segments:
-                            if s['points'] == [(X[k],Y[k]), (X[i],Y[i])]:
-                                s['tail'] = node
-                                already_counted = True
-                                break
-
-                        if not already_counted:
-                            segments.append(dict(points=[(X[i],Y[i]), (X[k],Y[k])], head=node))
-                    else:
-                        try:
-                            n = indx_counted.index((k,i))
-                            """ The segment is already in the list; make the 
-                            current node the tail node. """
-                            segments[n]['tail'] = node
-                        except ValueError:
-                            """ The segment is not already in the list, so add it and 
-                            make the current node the head node. """
-                            segments.append(dict(points=[(X[i],Y[i]), (X[k],Y[k])], head=node))
-                            indx_counted.append((i,k))
+                    segments.append(dict(points=[(center), (C[k])], head=i, tail=k))
                 else:
-                    segments.append([(X[i],Y[i]), (X[k],Y[k])])
-        node += 1
+                    segments.append([(center), (C[k])])
     return segments
 
 def periodic_voronoi(n=100, include_nodes=False, segments=None):
@@ -129,9 +105,11 @@ def periodic_voronoi(n=100, include_nodes=False, segments=None):
                 extends_into_region = True
 
         for i,pt in enumerate(points):
-            if extends_into_region and (pt[0]<=-0.5 or pt[1]<=-0.5):
-                """ Extends across boundary in the negative direction 
-                (After wrapping the periodic B.C., there will be two identical 
+            if extends_into_region and (pt[0]<=-0.5 or pt[1]<=-0.5) and not (pt[0]<=-0.5 and pt[1]>0.5):
+                """ Extends across boundary in the negative 
+                x-direction, negative y-direction, or off the bottom-right 
+                corner (positive x-direction, negative y-direction).
+                After wrapping the periodic B.C., there will be two identical 
                 boundaries, one across in the positive direction, and one across 
                 in the negative. Here we flag the one going negative to reject it."""
                 is_double = True
@@ -145,9 +123,8 @@ def periodic_voronoi(n=100, include_nodes=False, segments=None):
                     indx = 1 if i==0 else 0
                     doubles.append(dict(segment=s, node_id=node, point_out=pt, point_in=points[indx]))
                     
-            if extends_into_region and (pt[0]>0.5 or pt[1]>0.5) and include_nodes:
-                """ This node will get replaced with one on the 
-                other side of the simulation b/c of the periodic 
+            if extends_into_region and include_nodes and (pt[0]>0.5 or pt[1]>0.5):
+                """ This segment will wrap around the simulation b/c of the periodic 
                 boundary conditions. """
                 end = 'head' if i==0 else 'tail'
                 phantom = s[end]
@@ -163,7 +140,7 @@ def periodic_voronoi(n=100, include_nodes=False, segments=None):
     if include_nodes:
         """ Fix the nodes of the segments that wrap around the
         simulation region """
-        tol = 1.0e-3
+        tol = 1.0e-6
         for d in doubles:
             """ find segment in wrappers that is the duplicate of d
             once periodic b.c. are imposed. """
@@ -205,7 +182,6 @@ def periodic_diagram_with_nodes(n):
             indx = nodelist.index(seg['tail'])
             node_segments[indx].append(i)
         
-    print "number of nodes:", len(node_segments)
     for i,n in enumerate(node_segments):
         if len(n) < 3:
             raise ValueError("too few ({0}) segments for node {1} of {2}".format(len(n), i, len(node_segments)))
@@ -237,12 +213,12 @@ def plot_test():
 
     nodelist      = []
     for seg in center_tile:
-        if seg['points'][0] not in nodelist:
-            nodelist.append(seg['points'][0])
+        if seg['head'] not in nodelist:
+            nodelist.append(seg['head'])
             x,y = seg['points'][0]
             ax.text(x,y,str(seg['head']))
-        if seg['points'][1] not in nodelist:
-            nodelist.append(seg['points'][1])
+        if seg['tail'] not in nodelist:
+            nodelist.append(seg['tail'])
             x,y = seg['points'][1]
             ax.text(x,y,str(seg['tail']))
 
@@ -260,77 +236,4 @@ def plot_test():
     fig.canvas.draw()
 
 
-if __name__ == '__main__':
-
-    if False:
-        """ Plot periodic Voronoi diagram made using tiles method
-        and overlay the center tile """
-        segments    = voronoi(100, periodic=True)
-        center_tile = periodic_voronoi(segments=segments)
-        
-        """ Plot all segments: """
-        fig = plt.figure(1)
-        ax  = fig.add_subplot(111)
-        ax.cla()
-        lines = mpl.collections.LineCollection(segments, color='0.75')
-        ax.add_collection(lines)
-
-        """ Overlay those that cross into the unit square centered on (0,0): """
-        goodlines = mpl.collections.LineCollection(center_tile, color='0.15')
-        ax.add_collection(goodlines)
-
-        """ Add a box from (0,0) to (1,1) to show boundaries """
-        l,u = -0.5, 0.5
-        box = [[(l,l),(l,u)], [(l,l),(u,l)], [(u,u),(l,u)], [(u,u),(u,l)]]
-        lines2 = mpl.collections.LineCollection(box, color='0.25')
-        ax.add_collection(lines2)
-
-        #ax.axis([0,1,0,1])
-        ax.axis([-1.6,1.6,-1.6,1.6])
-        ax.set_aspect('equal')
-
-        plt.show()
-        fig.canvas.draw()
-    else:
-        """ Same, but do it with node ID turned on and label nodes on
-        the center tile. """
-        segments    = voronoi(100, periodic=True, include_nodes=True)
-        center_tile = periodic_voronoi(segments=segments, include_nodes=True)
-        
-        """ Plot all segments: """
-        fig = plt.figure(1)
-        ax  = fig.add_subplot(111)
-        ax.cla()
-        line_segments = [s['points'] for s in segments]
-        lines = mpl.collections.LineCollection(line_segments, color='0.75')
-        ax.add_collection(lines)
-
-        """ Overlay those that cross into the unit square centered on (0,0): """
-        center_segments = [s['points'] for s in center_tile]
-        goodlines = mpl.collections.LineCollection(center_segments, color='0.15')
-        ax.add_collection(goodlines)
-
-        nodelist      = []
-        for seg in center_tile:
-            if seg['points'][0] not in nodelist:
-                nodelist.append(seg['points'][0])
-                x,y = seg['points'][0]
-                ax.text(x,y,str(seg['head']))
-            if seg['points'][1] not in nodelist:
-                nodelist.append(seg['points'][1])
-                x,y = seg['points'][1]
-                ax.text(x,y,str(seg['tail']))
-
-        """ Add a box from (0,0) to (1,1) to show boundaries """
-        l,u = -0.5, 0.5
-        box = [[(l,l),(l,u)], [(l,l),(u,l)], [(u,u),(l,u)], [(u,u),(u,l)]]
-        lines2 = mpl.collections.LineCollection(box, color='0.25')
-        ax.add_collection(lines2)
-
-        #ax.axis([0,1,0,1])
-        ax.axis([-1.6,1.6,-1.6,1.6])
-        ax.set_aspect('equal')
-
-        plt.show()
-        fig.canvas.draw()
 

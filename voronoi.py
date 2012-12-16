@@ -41,7 +41,7 @@ def voronoi(n, periodic=False, include_nodes=False):
     X,Y = C[:,0], C[:,1]
     segments = []
     node = 0
-    for i in range(len(C)):
+    for i in xrange(len(C)):
         for k in D.triangle_neighbors[i]:
             """ The triangle neighbors are the triangles that share edges
             with a given triangle. The segments of the Voronoi diagram 
@@ -50,15 +50,26 @@ def voronoi(n, periodic=False, include_nodes=False):
             if k != -1:
                 if include_nodes:
                     """ Avoid double-counting """
-                    try:
-                        n = [s['points'] for s in segments].index([(X[k],Y[k]), (X[i],Y[i])])
-                        """ The segment is already in the list; make the 
-                        current node the tail node. """
-                        segments[n]['tail'] = node
-                    except ValueError:
-                        """ The segment is not already in the list, so add it and 
-                        make the current node the head node. """
+                    already_counted = False
+                    for s in segments:
+                        if s['points'] == [(X[k],Y[k]), (X[i],Y[i])]:
+                            s['tail'] = node
+                            already_counted = True
+                            break
+
+                    if not already_counted:
                         segments.append(dict(points=[(X[i],Y[i]), (X[k],Y[k])], head=node))
+
+                    if False:
+                        try:
+                            n = [s['points'] for s in segments].index([(X[k],Y[k]), (X[i],Y[i])])
+                            """ The segment is already in the list; make the 
+                            current node the tail node. """
+                            segments[n]['tail'] = node
+                        except ValueError:
+                            """ The segment is not already in the list, so add it and 
+                            make the current node the head node. """
+                            segments.append(dict(points=[(X[i],Y[i]), (X[k],Y[k])], head=node))
                 else:
                     segments.append([(X[i],Y[i]), (X[k],Y[k])])
         node += 1
@@ -173,6 +184,9 @@ def periodic_diagram_with_nodes(n):
 
     return diagram, nodelist, node_segments
     
+def runtest():
+    """ test of periodic tesselation for profiler """
+    segments, nodelist, node_segments = periodic_diagram_with_nodes(150)
 
 if __name__ == '__main__':
 

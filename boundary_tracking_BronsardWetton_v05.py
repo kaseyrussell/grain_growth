@@ -158,30 +158,31 @@ for b in boundary_objects:
 if 'time' in sys.argv:
     time_end = float(sys.argv[sys.argv.index('time') + 1])
 else:
-    time_end = 0.5
+    time_end = 1.5 #0.5
 
 phi = np.linspace(0,2*np.pi, 100)
 domain_boundary = np.array([np.cos(phi), np.sin(phi)])
-fig = plt.figure(1)
-ax2 = fig.add_subplot(111)
-def printplot(i):
-    ax2.cla()
-    markersize=4.0
-    for b in boundary_objects:
-        b.convert_to_columns()
-        d = b.get_boundary()
-        ax2.plot( d[0], d[1], '-k' )
-        b.convert_to_points()
-    ax2.plot( domain_boundary[0], domain_boundary[1], '-k' )
-    ax2.set_aspect('equal')
-    ax2.set_xlim(-1.1,1.1)
-    ax2.set_ylim(-1.1,1.1)
-    ax2.set_xticks([])
-    ax2.set_yticks([])
-    fig.canvas.draw()
-    if 'movie' in sys.argv:
-        fname = 'tmp/sim_{0:0>4}.png'.format(i)
-        plt.savefig(fname, dpi=100)
+if 'noprofile' in sys.argv:
+    fig = plt.figure(1)
+    ax2 = fig.add_subplot(111)
+    def printplot(i):
+        ax2.cla()
+        markersize=4.0
+        for b in boundary_objects:
+            b.convert_to_columns()
+            d = b.get_boundary()
+            ax2.plot( d[0], d[1], '-k' )
+            b.convert_to_points()
+        ax2.plot( domain_boundary[0], domain_boundary[1], '-k' )
+        ax2.set_aspect('equal')
+        ax2.set_xlim(-1.1,1.1)
+        ax2.set_ylim(-1.1,1.1)
+        ax2.set_xticks([])
+        ax2.set_yticks([])
+        fig.canvas.draw()
+        if 'movie' in sys.argv:
+            fname = 'tmp/sim_{0:0>4}.png'.format(i)
+            plt.savefig(fname, dpi=100)
 
 for b in boundary_objects:
     b.extrapolate()
@@ -237,7 +238,8 @@ def make_movie():
 if 'movie' in sys.argv:
     make_movie()
 
-plt.show()
-fig.canvas.draw()
+if 'noprofile' in sys.argv:
+    plt.show()
+    fig.canvas.draw()
 
 

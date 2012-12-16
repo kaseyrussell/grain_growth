@@ -29,7 +29,7 @@ film.set_resolution(h)
 """ Generate the initial conditions using a linear fit to the points of 
     a Voronoi diagram.
     """
-film.initialize_graph(300)
+film.initialize_graph(30)
 print "YES!!!"
 
 if 'time' in sys.argv:
@@ -60,7 +60,7 @@ def printplot(i, film):
 dt_movie = 0.005  # increment 
 t_movie  = 0.0   # acquire frame if t>t_movie
 i        = 0     # frame number
-if True:
+if False:
     if 'noprofile' in sys.argv:
         film.update_nodes()
         while t <= time_end: #1.0:
