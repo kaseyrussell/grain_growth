@@ -4,6 +4,13 @@ import matplotlib.pyplot as plt
 import sys
 import cPickle
 from scipy import interpolate
+import pyximport
+pyximport.install(setup_args = {'options' :
+                                {'build_ext' :
+                                 {'libraries' : 'lapack',
+                                  'include_dirs' : np.get_include(),
+                                  }}})
+
 import grain_growth_cython as grain_growth
 #import grain_growth
 #reload(grain_growth)
