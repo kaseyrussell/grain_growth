@@ -29,7 +29,7 @@ film.set_resolution(h)
 """ Generate the initial conditions using a linear fit to the points of 
     a Voronoi diagram.
     """
-film.initialize_graph(30)
+film.initialize_graph(30, load_voronoi='init_voronoi_30.pkl')
 print "YES!!!"
 
 if 'time' in sys.argv:
@@ -92,7 +92,11 @@ if False:
             t = 0.0
             runloop(t,film)
 
-
+def s():
+    film.junction_iteration()
+    film.regrid()
+    printplot(0,film)
+    
 if 'save' in sys.argv:
     data = dict( boundaries=film.boundaries, nodes=film.nodes, t=t )
     fname = "state_time_{0:.3f}.pkl".format(t) 

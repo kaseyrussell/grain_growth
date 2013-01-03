@@ -12,8 +12,11 @@ pyximport.install(setup_args = {'options' :
                                   }}})
 
 import grain_growth_cython as grain_growth
-#import grain_growth
-#reload(grain_growth)
+
+## Tried to separate it, but had trouble defining custom types...:
+#from grain_growth_boundary import Boundary
+#from grain_growth_node     import Node
+#from grain_growth_thinfilm import ThinFilm
 
 
 """Try to copy fig 4 from Bronsard & Wetton
@@ -32,11 +35,11 @@ import grain_growth_cython as grain_growth
 n = 16 # number of interior points per boundary in initial graph
 def make_boundary(b):
     """ interpolate boundary b and return 
-        a Boundary instance
+        a grain_growth.Boundary instance
         the interpolation is done over an array of
         length n+2, which includes node points;
         these are stripped before this is 
-        passed to create a Boundary instance """
+        passed to create a grain_growth.Boundary instance """
     f = interpolate.UnivariateSpline(b[0], b[1], s=0)
     xf = np.linspace(b[0][0], b[0][-1], n+2)
     yf = f(xf)
@@ -87,7 +90,7 @@ b21 = np.array([[b2[0][0],b1[0][0]], [b2[1][0],b1[1][0]]])
 b61 = np.array([[b6[0][0],b1[0][0]], [b6[1][0],b1[1][0]]])
 
 
-""" Convert arrays to Boundary instances: """
+""" Convert arrays to grain_growth.Boundary instances: """
 B1, B2, B3, B4, B5, B6 = [make_boundary(b) for b in [b1,b2,b3,b4,b5,b6]]
 B32, B43, B45, B56     = [make_boundary(b) for b in [b32,b43,b45,b56]]
 B21, B61               = [make_special_boundary(b) for b in [b21, b61]]
@@ -165,7 +168,7 @@ for b in boundary_objects:
 if 'time' in sys.argv:
     time_end = float(sys.argv[sys.argv.index('time') + 1])
 else:
-    time_end = 1.5 #0.5
+    time_end = 2.0 #0.5
 
 phi = np.linspace(0,2*np.pi, 100)
 domain_boundary = np.array([np.cos(phi), np.sin(phi)])

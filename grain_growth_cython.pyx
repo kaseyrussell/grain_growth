@@ -16,6 +16,7 @@ pyximport.install(setup_args = {'options' :
                                   'include_dirs' : np.get_include(),
                                   }}})
 from matrix_solvers import dgtsvx, dgesv, tridiagonal_solve
+import cPickle
 
 """ Implementation of boundary tracking method from Bronsard & Wetton
     "A Numerical Method for Tracking Curve Networks Moving with Curvature Motion"
@@ -30,9 +31,14 @@ from matrix_solvers import dgtsvx, dgesv, tridiagonal_solve
     is not guaranteed to work, not guaranteed
     against anything, use at your own risk, etc.
     
-    I build this using a setup.py file along with the following command:
+    I now build this using pyximport using the following code before import:
 
-        python setup.py build_ext --inplace
+        import pyximport
+        pyximport.install(setup_args = {'options' :
+                                        {'build_ext' :
+                                         {'libraries' : 'lapack',
+                                          'include_dirs' : np.get_include(),
+                                          }}})
     
     And if you want an html file with color-coded 'python-ness' of each line:
 
@@ -46,7 +52,7 @@ cdef:
     int empty           = 2
     int head_end        = 3
     int tail_end        = 4
-    bool verbose        = False
+    bool verbose        = True
 
 cpdef int type_empty():
     return empty
@@ -185,11 +191,8 @@ cdef class Boundary(object):
             Py_ssize_t lenb = len(self.b)
             Py_ssize_t i
             np.ndarray[dtype=np.float64_t, ndim=2] b_prev_iteration = np.empty((lenb,2), dtype=np.float64)
-            #np.ndarray[dtype=np.float64_t, ndim=2] b_prev_timestep
-            #np.ndarray[dtype=np.float64_t, ndim=2] b_prev_timestep_y
+            #np.ndarray[dtype=np.float64_t, ndim=2] b_prev_timestep = np.empty((2,lenb), dtype=np.float64)
             np.ndarray[dtype=np.float64_t, ndim=2] b_solve = np.empty((lenb,2), dtype=np.float64)
-            #np.ndarray[dtype=np.float64_t, ndim=2] b_solve_x
-            #np.ndarray[dtype=np.float64_t, ndim=2] b_solve_y
             np.ndarray[dtype=np.float64_t, ndim=1] offdiagdn = np.empty((lenb-1), dtype=np.float64)
             np.ndarray[dtype=np.float64_t, ndim=1] diag = np.empty((lenb), dtype=np.float64)
             np.ndarray[dtype=np.float64_t, ndim=1] offdiagup = np.empty((lenb-1), dtype=np.float64)
@@ -225,16 +228,19 @@ cdef class Boundary(object):
         self.get_tail_location(node_location)
         self.b_prev_timestep[lenb-1] = 2.0*node_location
         
-        #self.b = dgtsvx( offdiagdn, diag, offdiagup, self.b_prev_timestep.transpose() )
-        #self.b = tridiagonal_solve( offdiagdn, diag, offdiagup, self.b_prev_timestep.transpose() )
+        #b_prev_timestep = self.b_prev_timestep.copy().transpose()
+        #b_solve = dgtsvx( offdiagdn, diag, offdiagup, b_prev_timestep ) # fails immediately...
+        #self.b = b_solve
+        #self.b = tridiagonal_solve( offdiagdn, diag, offdiagup, b_prev_timestep.transpose() ) # fails at time 1.8
         
         M      = np.diag(diag) + np.diag(offdiagup, k=1) + np.diag(offdiagdn, k=-1)
         b_solve = np.linalg.solve( M, self.b_prev_timestep )
         self.b = b_solve
-        #b_prev_timestep = self.b_prev_timestep[:]
-        #self.b = dgesv( M, b_prev_timestep )
-
-        #self.b = b_solve.transpose()
+        ##b_prev_timestep = self.b_prev_timestep.copy()
+        ##b_solve = dgesv( M, b_prev_timestep.transpose() )
+        ##self.b = b_solve.transpose()
+        #assert np.shape(b_solve.transpose()) == np.shape(self.b)
+        
         
         delta_max = 0.0
         for i in range(lenb):
@@ -313,6 +319,9 @@ cdef class Boundary(object):
         prev_boundary, prev_endindx, prev_end = self.get_previous_boundary(node)
         subs_boundary, subs_endindx, subs_end = self.get_subsequent_boundary(node)
 
+         # TODO: correct the vectors v0, vprev, and vsubs for periodic b.c.
+         #        and alter rotation algorithm accordingly.
+         
         b0_nodeindx, b0_indx = 0, 1
         if self.tail == node:
             # check if Node is connected to tail rather than head
@@ -403,8 +412,9 @@ cdef class Boundary(object):
     @cython.boundscheck(False)
     @cython.wraparound(False)
     cpdef get_head_location(self, np.ndarray[dtype=np.float64_t, ndim=1] loc):
-        """ Return the location of the head node and shift it by node._domain_width 
-        if it exceeds the periodic b.c. """
+        """ Puts the location of the head node (as viewed by the boundary)
+        into the given 2-element numpy array,
+        shifting it by node._domain_width if it exceeds the periodic b.c. """
         cdef:
             double x,y,x0,y0
             Py_ssize_t indx
@@ -424,8 +434,9 @@ cdef class Boundary(object):
     @cython.boundscheck(False)
     @cython.wraparound(False)
     cpdef get_tail_location(self, np.ndarray[dtype=np.float64_t, ndim=1] loc):
-        """ Return the location of the tail node and shift it by node._domain_width 
-        if it exceeds the periodic b.c. """
+        """ Puts the location of the tail node (as viewed by the boundary)
+        into the given 2-element numpy array,
+        shifting it by node._domain_width if necessary within periodic b.c. """
         cdef:
             double x,y,x0,y0
             double period = self.tail._domain_width
@@ -445,8 +456,9 @@ cdef class Boundary(object):
     @cython.boundscheck(False)
     @cython.wraparound(False)
     cpdef get_node_location(self, Node node, np.ndarray[dtype=np.float64_t, ndim=1] xy):
-        """ Return the location of the node and shift it by node._domain_width 
-        if it exceeds the periodic b.c. """
+        """ Puts the location of the given node (as viewed by the boundary)
+        into the given 2-element numpy array,
+        shifting it by node._domain_width if it exceeds the periodic b.c. """
         cdef:
             Boundary gb
             double x,y,period,x0,y0
@@ -611,7 +623,7 @@ cdef class Boundary(object):
             self.b[0]  = self.head.position
             self.b[len(self.b)-1] = self.tail.position
 
-        old_boundary    = self.b[:]
+        old_boundary    = self.b.copy()
         self.b          = np.zeros([new_length,2])
         delta_vectors   = np.diff(old_boundary, axis=0)
         delta_scalars   = np.array([0]+[norm(d) for d in delta_vectors])
@@ -652,6 +664,37 @@ cdef class Boundary(object):
         self.interpolate(new_length, nodeless)
         
 
+    cdef int check_for_deletion(self):
+        """ Check if the boundary will be deleted at the end of the current timestep. """
+        cdef:
+            Py_ssize_t lenb = len(self.b)
+            np.ndarray[np.float64_t, ndim=2] b
+            np.ndarray normd1x2 = np.zeros(lenb-2, dtype=np.float64)
+            Py_ssize_t i, stop
+            double min_velocity = 0.0
+            double h, D1x, D1y, mu, norm2
+        
+        b = self.b
+        h = self._h
+        mu = 10.0*h # just pick something bigger than anything you would encounter
+        for i in xrange(1,lenb-1):
+            D1x = (b[i+1,0]-b[i-1,0])/2.0/h
+            D1y = (b[i+1,1]-b[i-1,1])/2.0/h
+            norm2 = D1x*D1x + D1y*D1y
+            normd1x2[i-1] = norm2
+            if norm2 < mu:
+                mu = norm2
+        
+        if lenb < 5 and ((mu < h*h/10.0)
+                          or  ((self._prev_length > self._length)
+                                and  (self._length < h/10.0))):
+            """ we're down to two interior points and need to kill the boundary """
+            #print "delete"
+            self._to_be_deleted = True
+            return 1
+        return 0
+
+
     cpdef check_spacing(self, bool nodeless=False):
         """ we need to refine our mesh when it gets too coarse, coarsen it when it gets dense,
             and cut it when it gets to 2 interior points. """
@@ -681,6 +724,15 @@ cdef class Boundary(object):
         #nu = max(normd1x2)
         #mu = min(normd1x2)
         
+        if nu > 4.0:
+            self.densify(nodeless)
+            return self.check_spacing(nodeless)
+
+        if nu < 1.0/4.0 and lenb > 4.0:
+            self.coarsen(nodeless)
+            return self.check_spacing(nodeless)
+
+
         if lenb < 5 and ((mu < h*h/10.0)
                           or  ((self._prev_length > self._length)
                                 and  (self._length < h/10.0))):
@@ -688,12 +740,8 @@ cdef class Boundary(object):
             #print "delete"
             self._to_be_deleted = True
             return False
-
-        if nu > 4.0:
-            self.densify(nodeless)
-        if nu < 1.0/4.0 and lenb > 4.0:
-            self.coarsen(nodeless)
-
+        else:
+            return True
 
     def set_termination(self, int end, Node termination):
         """ Set the termination object for the specified end of the grain boundary.
@@ -836,16 +884,27 @@ cdef class Node(object):
             that is connected to this triple point.
         """
         assert self._type == triple_point
-        cdef Boundary bndry
+        cdef:
+            Boundary   bndry
+            Py_ssize_t indx
+            int        end
+            np.ndarray[dtype=np.float64_t, ndim=1] p1  = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] p2  = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] p3  = np.empty((2))
+
         for b in [b1,b2,b3]:
             bndry, indx, end = self.parse_boundary(b)
             #bndry.check_spacing(True)
             self.boundaries.append(bndry)
-            self.endindx.append(indx)
+            self.endindx.append(indx)      # TODO: update endindx appropriately as boundaries are coarsened or densified
             self.ends.append(end)
 
         if not self.fits_inside_triangle():
-            print 'adjusting boundaries for node {0} at {1}'.format(self.get_id().split('-')[0], self.position)
+            print 'In Node.add_boundaries, adjusting boundaries for node {0} at {1}'.format(self.get_id().split('-')[0], self.position)
+            if verbose:
+                print ' node position:', self.position
+                self.get_triangle(p1,p2,p3)
+                print ' triangle:', p1,p2,p3
             #bndry = self.get_shorty_boundary()
             bndry = self.get_obtuse_boundary()
             bndry.curve_thy_neighbors(self)
@@ -861,6 +920,19 @@ cdef class Node(object):
             #    self.shift_closest_points()
             
         self.update_position()
+
+    def overwrite_extrapolation_points(self):
+        """ Store the node location in the extrapolation points of each
+        boundary (i.e. the first or last (x,y) point in the boundary array),
+        adjusting the Node location appropriately for each boundary to account 
+        for periodic boundary conditions. """
+        cdef Boundary   b
+        cdef Py_ssize_t i
+        for b in self.boundaries:
+            if self == b.head:
+                b.get_head_location(b.b[0])
+            else:
+                b.get_tail_location(b.b[len(b.b)-1])
 
 
     def shift_closest_points(self):
@@ -921,8 +993,9 @@ cdef class Node(object):
     @cython.wraparound(False)
     #cdef void get_closest_interior_point(self, Py_ssize_t indx, double[:] closest_point) except *:
     cdef void get_closest_interior_point(self, Py_ssize_t indx, np.ndarray[dtype=np.float64_t, ndim=1] closest_point) except *:
-        """ Return the point on the boundary closest to the node (i.e. point [1] or 
-        point [-2]) and shift it by self._domain_width if it exceeds the periodic b.c. """
+        """ Return the point on self.boundary[indx] that is closest to this node
+        (i.e. point [1] or point [-2] of the boundary) and shift it by 
+        self._domain_width as appropriate for the periodic b.c. """
         cdef:
             Boundary gb
             double x,y,x0,y0,domain_width
@@ -932,7 +1005,7 @@ cdef class Node(object):
                     
         gb   = self.boundaries[indx]
         bendindx = 1 if self.ends[indx] == head_end else len(gb.b)-2
-        x, y = gb.b[bendindx]
+        x, y   = gb.b[bendindx]
         x0, y0 = self.position
         domain_width = self._domain_width 
         if fabs(x-x0) > domain_width/2.0:
@@ -949,8 +1022,10 @@ cdef class Node(object):
     #cdef get_triangle(self, double[:] p0, double[:] p1, double[:] p2):
     @cython.boundscheck(False)
     @cython.wraparound(False)
-    cpdef get_triangle(self, np.ndarray[dtype=np.float64_t, ndim=1] p0,
-        np.ndarray[dtype=np.float64_t, ndim=1] p1, np.ndarray[dtype=np.float64_t, ndim=1] p2):
+    cpdef get_triangle(self,
+        np.ndarray[dtype=np.float64_t, ndim=1] p0,
+        np.ndarray[dtype=np.float64_t, ndim=1] p1,
+        np.ndarray[dtype=np.float64_t, ndim=1] p2):
         """ Returns a tuple of the three end points of the Node in
         counter-clockwise order """
         #cdef:
@@ -963,7 +1038,7 @@ cdef class Node(object):
         self.get_closest_interior_point(0,p0)
         self.get_closest_interior_point(1,p1)
         self.get_closest_interior_point(2,p2)
-        return p0,p1,p2
+        #return p0,p1,p2
 
 
     @cython.boundscheck(False)
@@ -1002,14 +1077,17 @@ cdef class Node(object):
         else:
             if 0 == self.fits_inside_triangle():
                 for gb in self.boundaries:
-                    gb.check_spacing()
-                    if gb._to_be_deleted:
+                    if gb.check_for_deletion():
                         return 0
                 print 'In update_position, adjusting boundaries for node {0} at {1}'.format(self.get_id().split('-')[0], self.position)
                 #bndry = self.get_shorty_boundary()
                 bndry = self.get_obtuse_boundary()
-                #bndry.curve_thy_neighbors(self)
-                bndry.retract_from_node(self)
+                if True:
+                    # curve_thy_neighbors expects the 'target node' location
+                    # to be stored in the extrapolation storage points
+                    self.overwrite_extrapolation_points()
+                    bndry.curve_thy_neighbors(self)
+                #bndry.retract_from_node(self)
                 bndry.extrapolate()
 
             theta1 = theta2 = theta3 = 2.0*pi/3.0
@@ -1085,7 +1163,7 @@ cdef class Node(object):
         """ Just for testing. """
         return self.position
         
-    cdef int fits_inside_triangle(self):
+    cdef int fits_inside_triangle(self) except *:
         """ If the triangle formed by the initial endpoints of 
         the three intersecting boundaries is too oblique (i.e. if 
         one of the angles is larger than 120 degrees, then the 
@@ -1093,17 +1171,14 @@ cdef class Node(object):
         cdef:
             double theta_node, l1, l2, l3
             double phi1, phi2, phi3
-            np.ndarray[dtype=np.float64_t, ndim=1] p1
-            np.ndarray[dtype=np.float64_t, ndim=1] p2
-            np.ndarray[dtype=np.float64_t, ndim=1] p3
-            np.ndarray[dtype=np.float64_t, ndim=1] v13
-            np.ndarray[dtype=np.float64_t, ndim=1] v21
-            np.ndarray[dtype=np.float64_t, ndim=1] v23
+            np.ndarray[dtype=np.float64_t, ndim=1] p1  = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] p2  = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] p3  = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] v13 = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] v21 = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] v23 = np.empty((2))
             int true=1, false=0
         theta_node = 2.0*pi/3.0
-        p1 = np.empty((2))
-        p2 = np.empty((2))
-        p3 = np.empty((2))
         self.get_triangle(p1,p2,p3)
         v13 = p3 - p1 # vector running from pt1 to pt3
         v21 = p1 - p2 # vector running from pt2 to pt1
@@ -1115,7 +1190,7 @@ cdef class Node(object):
 
         """ If any of the following three angles is negative, then the node 
         won't fit in the interior of the triangle. """
-        phi1 = theta_node - acos(-(v21[0]*v13[0]+v21[1]*v13[1])/l2/l3) # np.arccos( dot(v21,-v13)/l2/l3) )
+        phi1 = theta_node - acos(-(v21[0]*v13[0] + v21[1]*v13[1])/l2/l3) # np.arccos( dot(v21,-v13)/l2/l3) )
         phi2 = theta_node - acos( (v21[0]*v23[0] + v21[1]*v23[1])/l1/l3 )
         phi3 = theta_node - acos( (v23[0]*v13[0] + v23[1]*v13[1])/l1/l2 )
         if (phi1 < 0) or (phi2 < 0) or (phi3 < 0):
@@ -1229,24 +1304,44 @@ cdef class ThinFilm(object):
         self._h = 1.0/16.0
         self._t = 0.0
         self._domain_width = 1.0
-        self._convergence = 1.0e-5
+        self._convergence  = 1.0e-5
 
     def set_convergence(self, double level):
         """ sum of changes on all boundaries must be less than this value. """
         self._convergence = level
 
-    def initialize_graph(self, num_grains=2500, num_interior_points_per_boundary=8):
+    def initialize_graph(self, num_grains=2500, num_interior_points_per_boundary=8,
+            save_voronoi=None, load_voronoi=None):
         """ Generate an initial set of Boundary and Node objects
         using a Voronoi diagram from a set of num_grains randomly spaced
         points on a domain with periodic boundary conditions. 
         The width and height of the simulation domain will be set 
         equal to the square root of n (so that one spatial unit of 
         the domain is approximately equal to the average grain 
-        diameter in the initial graph)."""
+        diameter in the initial graph).
+        The Voronoi diagram used as seed can be saved or loaded from file
+        by passing a filename to save_voronoi or load_voronoi.
+        If both are passed, save_voronoi is ignored."""
         # magnification factor from Voronoi diagram to our simulation region:
         mag = np.sqrt(num_grains)
         self._domain_width = mag
-        segments, nodelist, node_segments = voronoi.periodic_diagram_with_nodes(num_grains)
+        if load_voronoi is not None:
+            with open(load_voronoi,'rb') as fobj:
+                d = cPickle.load(fobj)
+            segments = d['segments']
+            nodelist = d['nodelist']
+            node_segments = d['node_segments']
+        else:
+            segments, nodelist, node_segments = voronoi.periodic_diagram_with_nodes(num_grains)
+            if save_voronoi is not None:
+                d = dict()
+                d['segments'] = segments
+                d['nodelist'] = nodelist
+                d['node_segments'] = node_segments
+                with open(save_voronoi, 'wb') as fobj:
+                    cPickle.dump(d,fobj)
+        
+                
         boundaries = []
         nodes = []
         for s in segments:
@@ -1361,6 +1456,10 @@ cdef class ThinFilm(object):
             Boundary a, b, b1,b2,b3
             int end, aend, bend
             Node TP1, TP2, new_node, n
+            np.ndarray[dtype=np.float64_t, ndim=1] t1 = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] t2 = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] p1 = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] p2 = np.empty((2))
 
         if gb.head._type == empty:
             """ gb loops onto itself, so it can just be removed. """
@@ -1420,8 +1519,9 @@ cdef class ThinFilm(object):
                 (these are referenced in order--previous and subsequent--
                 relative to the gb that is going to be deleted) """
                 head_index = gb.head.boundaries.index(gb)
-                head_prev_boundary = gb.head.boundaries[head_index-1]
-                head_prev_end = gb.head.ends[head_index-1]
+                head_prev_indx = head_index-1 if head_index > 0 else len(gb.head.boundaries)-1
+                head_prev_boundary = gb.head.boundaries[head_prev_indx]
+                head_prev_end = gb.head.ends[head_prev_indx]
                 if head_prev_end == head_end:
                     head_prev_endindx  = 1
                     head_prev_nodeindx = 0
@@ -1429,9 +1529,9 @@ cdef class ThinFilm(object):
                     head_prev_endindx  = len(head_prev_boundary.b)-2
                     head_prev_nodeindx = len(head_prev_boundary.b)-1
                 
-                subs_indx = head_index+1 if head_index+1 < len(gb.head.boundaries) else 0
-                head_subs_boundary = gb.head.boundaries[subs_indx]
-                head_subs_end = gb.head.ends[subs_indx]
+                head_subs_indx = head_index+1 if head_index+1 < len(gb.head.boundaries) else 0
+                head_subs_boundary = gb.head.boundaries[head_subs_indx]
+                head_subs_end = gb.head.ends[head_subs_indx]
                 if head_subs_end == head_end:
                     head_subs_endindx  = 1
                     head_subs_nodeindx = 0
@@ -1440,8 +1540,9 @@ cdef class ThinFilm(object):
                     head_subs_nodeindx = len(head_subs_boundary.b)-1
                 
                 tail_index = gb.tail.boundaries.index(gb)
-                tail_prev_boundary = gb.tail.boundaries[tail_index-1]
-                tail_prev_end = gb.tail.ends[tail_index-1]
+                tail_prev_indx = tail_index-1 if tail_index > 0 else len(gb.tail.boundaries)-1
+                tail_prev_boundary = gb.tail.boundaries[tail_prev_indx]
+                tail_prev_end = gb.tail.ends[tail_prev_indx]
                 if tail_prev_end == head_end:
                     tail_prev_endindx  = 1
                     tail_prev_nodeindx = 0
@@ -1449,9 +1550,9 @@ cdef class ThinFilm(object):
                     tail_prev_endindx  = len(tail_prev_boundary.b)-2
                     tail_prev_nodeindx = len(tail_prev_boundary.b)-1
 
-                subs_indx = tail_index+1 if tail_index+1 < len(gb.tail.boundaries) else 0
-                tail_subs_boundary = gb.tail.boundaries[subs_indx]
-                tail_subs_end = gb.tail.ends[subs_indx]
+                tail_subs_indx = tail_index+1 if tail_index+1 < len(gb.tail.boundaries) else 0
+                tail_subs_boundary = gb.tail.boundaries[tail_subs_indx]
+                tail_subs_end = gb.tail.ends[tail_subs_indx]
                 if tail_subs_end == head_end:
                     tail_subs_endindx  = 1
                     tail_subs_nodeindx = 0
@@ -1509,7 +1610,7 @@ cdef class ThinFilm(object):
 
                 if verbose: print "  4* situation, should conserve # nodes and # boundaries."
                 
-                """ Then it must be possibility #1.
+                """ Possibility #1.
                 Our new triple points will connect the following
                 grain boundaries in the following order:
                 1) tail_prev
@@ -1524,15 +1625,24 @@ cdef class ThinFilm(object):
 
                 First we need to make the new grain boundary:
                 """
-                p1 = (head_subs_boundary.b[head_subs_endindx] + tail_prev_boundary.b[tail_prev_endindx])/2
-                p2 = (head_prev_boundary.b[head_prev_endindx] + tail_subs_boundary.b[tail_subs_endindx])/2
+                
+                # This method ignores periodic b.c.:
+                #p1 = (head_subs_boundary.b[head_subs_endindx] + tail_prev_boundary.b[tail_prev_endindx])/2
+                #p2 = (head_prev_boundary.b[head_prev_endindx] + tail_subs_boundary.b[tail_subs_endindx])/2
+                
+                gb.head.get_closest_interior_point(head_subs_indx, t1)
+                gb.tail.get_closest_interior_point(tail_prev_indx, t2)
+                p1 = (t1+t2)/2
+
+                gb.head.get_closest_interior_point(head_prev_indx, t1)
+                gb.tail.get_closest_interior_point(tail_subs_indx, t2)
+                p2 = (t1+t2)/2
+
                 new_head = p1+(p2-p1)/3.0
                 new_tail = p2+(p1-p2)/3.0
                 new_node_head = p1+(p2-p1)/6.0
                 new_node_tail = p2+(p1-p2)/6.0
-                print "new head:", new_head
-                print "new tail:", new_tail
-                new_gb = Boundary(np.array([new_node_head,new_head,new_tail,new_node_tail]), as_points=True)
+                new_gb   = Boundary(np.array([new_node_head,new_head,new_tail,new_node_tail]), as_points=True)
 
                 """ Reset the 'extrapolated' points in the surviving boundaries so that when
                 the boundaries are added to the node, they can be adjusted to ensure
@@ -1549,12 +1659,14 @@ cdef class ThinFilm(object):
                 self.boundaries.remove(gb)
                 
                 self.boundaries.append(new_gb)
-                TP1 = Node(node_type=triple_point)
+                TP1 = Node(node_type=triple_point, period=self._domain_width)
+                TP1.set_position(new_node_head)
                 TP1.add_boundaries(
                     dict(b=tail_prev_boundary, end=tail_prev_end),
                     dict(b=head_subs_boundary, end=head_subs_end),
                     dict(b=new_gb, end=head_end))
-                TP2 = Node(node_type=triple_point)
+                TP2 = Node(node_type=triple_point, period=self._domain_width)
+                TP2.set_position(new_node_tail)
                 TP2.add_boundaries(
                     dict(b=head_prev_boundary, end=head_prev_end),
                     dict(b=tail_subs_boundary, end=tail_subs_end),
@@ -1589,8 +1701,11 @@ cdef class ThinFilm(object):
             Boundary new_boundary, gb
             Node a_surviving_node, b_surviving_node
             int a_surviving_end, b_surviving_end, indx
+            np.ndarray[dtype=np.float64_t, ndim=1] a_node = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] b_node = np.empty((2))
+            np.ndarray[dtype=np.float64_t, ndim=1] shift  = np.empty((2))
         
-        print "CONCATENATING!!!"
+        if verbose: print "Concatenating boundaries."
         while len(a.b) > len(b.b):
             b.densify()
         while len(a.b) < len(b.b):
@@ -1598,20 +1713,30 @@ cdef class ThinFilm(object):
         
         if aend == tail_end:
             a_surviving_end = head_end
+            a.get_head_location(a_node)
             if bend == head_end:
                 b_surviving_end = tail_end
-                new_array = np.concatenate((a.b[:len(a.b)-1], b.b[1:]), axis=0)
+                b.get_tail_location(b_node)
+                shift = a_node - b_node
+                new_array = np.concatenate((a.b[:len(a.b)-1], b.b[1:]+shift), axis=0)
             else:
                 b_surviving_end = head_end
-                new_array = np.concatenate((a.b[:len(a.b)-1], b.b[len(b.b)-1::-1]), axis=0)
+                b.get_head_location(b_node)
+                shift = a_node - b_node
+                new_array = np.concatenate((a.b[:len(a.b)-1], b.b[len(b.b)-1::-1]+shift), axis=0)
         else:
             a_surviving_end = tail_end
+            a.get_tail_location(a_node)
             if bend == head_end:
                 b_surviving_end = tail_end
-                new_array = np.concatenate((a.b[len(a.b)-1::-1], b.b[1:]), axis=0)
+                b.get_tail_location(b_node)
+                shift = a_node - b_node
+                new_array = np.concatenate((a.b[len(a.b)-1::-1], b.b[1:]+shift), axis=0)
             else:                    
                 b_surviving_end = head_end
-                new_array = np.concatenate((a.b[len(a.b)-1::-1], b.b[len(a.b)-1::-1]), axis=0)
+                b.get_head_location(b_node)
+                shift = a_node - b_node
+                new_array = np.concatenate((a.b[len(a.b)-1::-1], b.b[len(a.b)-1::-1]+shift), axis=0)
 
         a_surviving_node = a.get_termination(a_surviving_end)
         b_surviving_node = b.get_termination(b_surviving_end)
@@ -1691,6 +1816,9 @@ cdef class ThinFilm(object):
         
         cdef Boundary bndry, sb, b1, b2, b3, b_cw, survivor 
         cdef Node tp, node1, node2, new_node
+        cdef np.ndarray[dtype=np.float64_t, ndim=1] loc   = np.empty((2))
+        cdef np.ndarray[dtype=np.float64_t, ndim=1] shift = np.empty((2))
+        cdef np.ndarray[dtype=np.float64_t, ndim=1] new_setpoint = np.empty((2))
             
         for bndry in to_be_deleted:
             if domain_boundary in [bndry.head._type, bndry.tail._type]:
@@ -1711,6 +1839,7 @@ cdef class ThinFilm(object):
                 of the survivors around the 'node set point' to ensure success of 
                 Node.update_position() when it is called for the first time. """
     
+            if verbose: print "Deleting three-sided bubble."
 
             b1, b2, b3 = to_be_deleted
             sb, sb_endindx, sb_end = b1.get_subsequent_boundary(b1.head)
@@ -1738,11 +1867,11 @@ cdef class ThinFilm(object):
             endpoints = np.zeros((3,2), dtype=np.float64)
             for i,tp in enumerate(ordered_nodes):
                 survivor, survivor_end = tp.get_sole_survivor()
-                indx = 1 if survivor_end == head_end else len(survivor.b)-2
-                endpoints[i] = survivor.b[indx]
+                #indx = 1 if survivor_end == head_end else len(survivor.b)-2
+                #endpoints[i] = survivor.b[indx]
+                # INSTEAD, use get_closest_interior_point?
+                tp.get_closest_interior_point(tp.boundaries.index(survivor), endpoints[i])
             new_setpoint = (endpoints[0] + endpoints[1] + endpoints[2])/3.0
-            print "new setpoint:", new_setpoint
-            print " endpoints:", endpoints
             
             survivors     = []
             survivor_ends = []
@@ -1750,14 +1879,22 @@ cdef class ThinFilm(object):
                 survivor, survivor_end = tp.get_sole_survivor()
                 survivors.append(survivor)
                 survivor_ends.append(survivor_end)
-                indx = 0 if survivor_end == head_end else len(survivor.b)-1
-                survivor.b[indx] = new_setpoint
+                tp.get_closest_interior_point(tp.boundaries.index(survivor), loc)
+                indx  = 0 if survivor_end == head_end else len(survivor.b)-1
+                iindx = 1 if survivor_end == head_end else len(survivor.b)-2
+                shift = survivor.b[iindx] - loc
+                survivor.b[indx] = new_setpoint + shift
+                if verbose:
+                    print " Deleting bubble, shift boundary {0} by {1}".format(i,shift)
+                    if any(survivor.b[:,0] > 0):
+                        print "  boundary:", survivor.b
                 self.nodes.remove(tp)
 
             self.boundaries.remove(b1)
             self.boundaries.remove(b2)
             self.boundaries.remove(b3)
-            new_node = Node(node_type=triple_point)
+            new_node = Node(node_type=triple_point, period=self._domain_width)
+            new_node.set_position(new_setpoint)
             new_node.add_boundaries(
                 dict(b=survivors[0], end=survivor_ends[0]),
                 dict(b=survivors[1], end=survivor_ends[1]),
@@ -1775,7 +1912,7 @@ cdef class ThinFilm(object):
     def delete_boundaries(self, list to_be_deleted):
         """ Remove boundaries through surgery. """
         cdef Boundary gb
-        for gb in to_be_deleted:
+        for gb in reversed(to_be_deleted):
             if gb.will_die_alone():
                 if verbose: print "  killing single boundary."
                 self.delete_single_boundary(gb)
@@ -1787,13 +1924,16 @@ cdef class ThinFilm(object):
             that B&W discussed. However, when doing implicit time-stepping, you can 
             essentially step through two successive deletion operations in one step."""
             self.delete_several_boundaries(to_be_deleted)
-        elif len(to_be_deleted) == 0:
-            return True
-        else:
+        elif len(to_be_deleted) == 2:
             if verbose: print "  deleting two boundaries at once. dt:", self._k
             if verbose: print "  Length of boundary list before deletion:", len(self.boundaries)
             self.delete_two_boundaries(to_be_deleted)
             if verbose: print "  Length of boundary list after deletion:", len(self.boundaries)
+        elif len(to_be_deleted) == 1:
+            gb = to_be_deleted[0]
+            self.delete_single_boundary(to_be_deleted[0])
+        elif len(to_be_deleted) == 0:
+            return True
             
                            
     def get_plot_lines(self):
@@ -1816,12 +1956,18 @@ cdef class ThinFilm(object):
             Boundary b
             Py_ssize_t i,j
             
+        for b in self.boundaries: 
+            b.check_spacing()
+
         for b in self.boundaries:
             if b.check_spacing() == False:
                 to_be_deleted.append(b)
         
         if len(to_be_deleted) > 0:
             if verbose: 
+                print "Pre-deletion number of Nodes: {0}:".format(len(self.nodes))
+
+            if False: 
                 print "Pre-deletion number of Nodes: {0} and list:".format(len(self.nodes))
                 for n in self.nodes:
                     if n.get_type() == triple_point:
@@ -1832,7 +1978,7 @@ cdef class ThinFilm(object):
                         print "    {0}".format(b3)
                     else:
                         print " {0}, {1}".format(n, n.get_type())
-            if verbose:
+
                 print " "
                 print "  And as listed from self.boundaries:"
                 for i,b in enumerate(self.boundaries):
@@ -1843,7 +1989,11 @@ cdef class ThinFilm(object):
                         print "  boundary {0} {1} ({5}): {2}, {3} {4}".format(i,end,n,n.get_type(),xtra,b)
 
             self.delete_boundaries(to_be_deleted)
+
             if verbose:
+                print "    Post-deletion number of Nodes: {0}:".format(len(self.nodes))
+
+            if False:
                 print "    Post-deletion number of Nodes: {0} and list:".format(len(self.nodes))
                 for n in self.nodes:
                     if n.get_type() == triple_point:
