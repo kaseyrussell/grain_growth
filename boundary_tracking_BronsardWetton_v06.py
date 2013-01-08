@@ -30,6 +30,7 @@ film.set_resolution(h)
     a Voronoi diagram.
     """
 film.initialize_graph(30, load_voronoi='init_voronoi_30.pkl')
+#film.initialize_graph(100, load_voronoi='init_voronoi_100.pkl')
 print "YES!!!"
 
 if 'time' in sys.argv:
@@ -44,14 +45,20 @@ def printplot(i, film):
     markersize=4.0
     
     segments = film.get_plot_lines()
-    lines = mpl.collections.LineCollection(segments, color='0.5')
+    if True:
+        shift        = film.get_domain_width()
+        for dx in [-1.0,0.0,1.0]:
+            for dy in [-1.0,0.0,1.0]:
+                shiftedlines = []
+                for s in segments:
+                    shiftedlines.append(s+np.array((dx*shift, 0.0))+np.array((0.0,dy*shift)))
+                ax.add_collection(mpl.collections.LineCollection(shiftedlines, color='0.8'))
+
+    lines = mpl.collections.LineCollection(segments, color='0.4')
     ax.add_collection(lines)
     ax.set_aspect('equal', 'datalim')
-    #ax.set_xlim(-1.1,1.1)
-    #ax.set_ylim(-1.1,1.1)
-    #ax.set_xticks([])
-    #ax.set_yticks([])
     ax.autoscale_view(True,True,True)
+            
     fig.canvas.draw()
     if 'movie' in sys.argv:
         fname = 'tmp/sim_{0:0>4}.png'.format(i)
@@ -60,7 +67,7 @@ def printplot(i, film):
 dt_movie = 0.005  # increment 
 t_movie  = 0.0   # acquire frame if t>t_movie
 i        = 0     # frame number
-if False:
+if True:
     if 'noprofile' in sys.argv:
         film.update_nodes()
         while t <= time_end: #1.0:
