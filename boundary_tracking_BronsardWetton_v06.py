@@ -56,9 +56,13 @@ def printplot(i, film):
 
     lines = mpl.collections.LineCollection(segments, color='0.4')
     ax.add_collection(lines)
-    ax.set_aspect('equal', 'datalim')
-    ax.autoscale_view(True,True,True)
-            
+    ax.set_aspect('equal') #, 'datalim')
+    #ax.autoscale_view(True,True,True)
+    ax.set_xlim(-7,7)
+    ax.set_ylim(-7,7)
+    ax.set_xticklabels('')
+    ax.set_yticklabels('')
+           
     fig.canvas.draw()
     if 'movie' in sys.argv:
         fname = 'tmp/sim_{0:0>4}.png'.format(i)

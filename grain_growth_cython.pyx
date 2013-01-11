@@ -295,13 +295,22 @@ cdef class Boundary(object):
         #    # probably we should just delete?
         #    return False
 
-        if node == self.head:
-            self.b[0] = self.b[1]
-            self.b[len(self.b)-1] = self.tail.position
-        else:
-            self.b[len(self.b)-1] = self.b[len(self.b)-2]
-            self.b[0] = self.head.position
+        if False:
+            """ assume we want to retract from both ends...
+            otherwise we need to keep track of whether we
+            have previously retracted from the node at the other 
+            end and, if so, don't reset to the node position.
+            """
+            if node == self.head:
+                self.b[0] = self.b[1]
+                self.b[len(self.b)-1] = self.tail.position
+            else:
+                self.b[len(self.b)-1] = self.b[len(self.b)-2]
+                self.b[0] = self.head.position
 
+        self.b[0] = self.b[1]
+        self.b[len(self.b)-1] = self.b[len(self.b)-2]
+        
         self.interpolate(len(self.b), True)
         self.extrapolate()
 
@@ -698,7 +707,7 @@ cdef class Boundary(object):
             if norm2 < mu:
                 mu = norm2
         
-        if lenb < 5 and ((mu < h*h/10.0)
+        if ((mu < h*h/10.0)
                           or  ((self._prev_length > self._length)
                                 and  (self._length < h/10.0))):
             """ we're down to two interior points and need to kill the boundary """
@@ -740,10 +749,14 @@ cdef class Boundary(object):
         
         if nu > 4.0:
             self.densify(nodeless)
+            if not nodeless:
+                self.extrapolate()
             return self.check_spacing(nodeless)
 
         if nu < 1.0/4.0 and lenb > 4.0:
             self.coarsen(nodeless)
+            if not nodeless:
+                self.extrapolate()
             return self.check_spacing(nodeless)
 
 
@@ -1110,7 +1123,7 @@ cdef class Node(object):
 
 
     @cython.boundscheck(False)
-    @cython.wraparound(False) # TODO: replace self.bendindx with only non-negative values
+    @cython.wraparound(False)
     cpdef int update_position( self, bool verbose=False, bool check_angles=False ) except *:
         """ Calculate the new location of the triple-point. """
         cdef:
@@ -1151,13 +1164,12 @@ cdef class Node(object):
                 return 0
                 
             if fits_inside == false:
-                self.fix_triangle()
+                #self.fix_triangle()
                 # return value of -1
                 # tells ThinFilm instance to reset all boundaries
                 # and restart current time step
-                return -1
+                #return -1
                 
-                if tries > 10: raise RuntimeError, "Failed adjusting boundaries in Node.update_position"
                 for gb in self.boundaries:
                     if gb.check_for_deletion():
                         return 0
@@ -1170,8 +1182,6 @@ cdef class Node(object):
                     self.overwrite_extrapolation_points()
                     bndry.curve_thy_neighbors(self)
                 bndry.retract_from_node(self)
-                bndry.extrapolate()
-                fits_inside = self.fits_inside_triangle()
 
             theta1 = theta2 = theta3 = 2.0*pi/3.0
             self.get_closest_interior_point(0,b1N)
@@ -2274,6 +2284,9 @@ cdef class ThinFilm(object):
                         xtra = "  NOT IN self.nodes." if n not in self.nodes else ""
                         print "  boundary {0} {1} ({5}): {2}, {3} {4}".format(i,end,n,n.get_type(),xtra,b)
         
+        for b in self.boundaries: 
+            b.check_spacing()
+
         return True
 
 
